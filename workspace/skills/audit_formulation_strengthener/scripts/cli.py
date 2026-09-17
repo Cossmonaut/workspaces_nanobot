@@ -46,19 +46,17 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-# Подключаем корень репо и scripts/ skill'а, чтобы sibling-модули
-# (``modes.*``, ``report.*``, ``skill_config``, ``llm``, ``output``)
-# импортировались и без выставленного PYTHONPATH.
+# При прямом запуске файла Python не добавляет корень репозитория в
+# ``sys.path``. Пакетный запуск (``python -m ...``) этого bootstrap не
+# требует; внутренние импорты ниже всегда остаются пакетными.
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
-_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 _PROJECT_ROOT = str(_SKILL_ROOT.parents[2])
-for _p in (_PROJECT_ROOT, _SCRIPTS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if __package__ in (None, "") and _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-import output as _output  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts import output as _output
+from workspace.skills.audit_formulation_strengthener.scripts.skill_config import get_cli_config
 from lib.services.llm_client import LLM_TIMEOUT_OVERRIDE
-from skill_config import get_cli_config  # noqa: E402
 
 
 MODES = ("analyze", "search", "synthesize", "all")
@@ -221,7 +219,7 @@ def _emit(payload: Any, *, target_path: str | None, is_report: bool) -> None:
 def _run_analyze(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     """Режим analyze. Возвращает (json-результат, текст-отчёт-or-None)."""
     # Реализуется на этапе 4
-    from modes import analyze as analyze_mode  # noqa: WPS433
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import analyze as analyze_mode
 
     return analyze_mode.run(
         violation=args.violation,
@@ -232,7 +230,7 @@ def _run_analyze(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
 
 def _run_search(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     """Режим search."""
-    from modes import search as search_mode  # noqa: WPS433
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import search as search_mode
 
     return search_mode.run(
         violation=args.violation,
@@ -250,7 +248,7 @@ def _run_search_with_analyze(
     prepared_bundle: Any = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Режим search с уже готовым результатом analyze (in-memory)."""
-    from modes import search as search_mode  # noqa: WPS433
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import search as search_mode
 
     return search_mode.run(
         violation=args.violation,
@@ -265,7 +263,7 @@ def _run_search_with_analyze(
 
 def _run_synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     """Режим synthesize. Возвращает (json, текст-отчёта)."""
-    from modes import synthesize as synth_mode  # noqa: WPS433
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import synthesize as synth_mode
 
     return synth_mode.run(
         violation=args.violation,
@@ -280,8 +278,8 @@ def _run_synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], str | Non
 
 def _run_all(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     """Полный пайплайн: analyze → search → synthesize."""
-    from modes import search as search_mode
-    from vnd_io import VndInputError
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import search as search_mode
+    from workspace.skills.audit_formulation_strengthener.scripts.vnd_io import VndInputError
     try:
         bundle = search_mode.prepare_vnd(vnd_paths=list(args.vnd_paths), violation=args.violation)
     except VndInputError as exc:
@@ -305,7 +303,7 @@ def _run_all(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
         return search_result, None
 
     # Синтез — отдельным вызовом (передаём in-memory JSON).
-    from modes import synthesize as synth_mode  # noqa: WPS433
+    from workspace.skills.audit_formulation_strengthener.scripts.modes import synthesize as synth_mode
 
     return synth_mode.run(
         violation=args.violation,
