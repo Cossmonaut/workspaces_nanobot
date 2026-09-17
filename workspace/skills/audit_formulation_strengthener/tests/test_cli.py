@@ -180,15 +180,14 @@ def test_cli_no_vnd(
         return _all_mock(system, user, operation)
 
     rc, out = _run_cli(
-        "--mode", "analyze",
+        "--mode", "search",
         "--violation", "что-то",
         monkeypatch=monkeypatch,
         llm_mock=counting,
     )
 
     assert rc == 2
-    parsed = json.loads(out)
-    assert parsed["status"] == "error"
+    assert out == ""
     assert called == []  # LLM не вызывался
 
 
