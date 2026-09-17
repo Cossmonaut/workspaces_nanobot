@@ -23,6 +23,25 @@ from unittest.mock import patch
 import pytest
 
 
+def _ensure_repo_paths() -> None:
+    """Добавить пути к репо для импорта ``lib``, ``llm``, ``chunking``."""
+    import os
+    repo_root = Path(__file__).resolve().parent  # tests/
+    while repo_root.name != "workspaces_nanobot" and repo_root.parent != repo_root:
+        repo_root = repo_root.parent
+    # Пути, которые нужны skill'ам для импорта
+    paths_to_add = [
+        str(repo_root),  # lib/*, config.py, etc.
+        str(repo_root / "workspace" / "skills" / "legal_summarizer" / "scripts"),  # llm/*, chunking/*
+    ]
+    for p in paths_to_add:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
+_ensure_repo_paths()
+
+
 # ---------------------------------------------------------------------------
 # Repo-root resolution
 # ---------------------------------------------------------------------------
