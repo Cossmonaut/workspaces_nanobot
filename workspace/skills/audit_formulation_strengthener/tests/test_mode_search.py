@@ -143,10 +143,10 @@ def test_search_resolve_violation_from_file(
     assert result["data"]["normalized_violation_used"] == "ИЗ ФАЙЛА"
 
 
-def test_search_one_chunk_failure_does_not_crash(
+def test_search_one_chunk_failure_blocks_synthesis(
     mock_prepare_vnd,
 ) -> None:
-    """Если LLM падает на одном чанке — остальные продолжают обрабатываться."""
+    """Неполный поиск не маскируется успешным результатом."""
     from modes import search
     from llm_client import JsonParseError
 
@@ -168,12 +168,11 @@ def test_search_one_chunk_failure_does_not_crash(
             vnd_paths=["vnd1.txt"],
         )
 
-    assert result["status"] == "success"
+    assert result["status"] == "error"
     data = result["data"]
+    assert data["error_type"] == "incomplete_search"
     assert data["chunks_failed"] >= 1
     assert data["chunks_processed"] == 3
-    # Должно быть как минимум 1 success finding.
-    assert len(data["vnd_findings"]) >= 1
 
 
 def test_search_invalid_relation_type_normalized(

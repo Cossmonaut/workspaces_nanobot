@@ -29,20 +29,10 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
-
-# Добавляем scripts/ skill'а в sys.path.
-_SKILL_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-from llm_client import JsonParseError, call_llm_json  # type: ignore[import-not-found]  # noqa: E402
-from prompts import load_prompt, render_prompt  # type: ignore[import-not-found]  # noqa: E402
-
-import output as _output  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.llm_client import JsonParseError, call_llm_json
+from workspace.skills.audit_formulation_strengthener.scripts.prompts import load_prompt, render_prompt
+from workspace.skills.audit_formulation_strengthener.scripts import output as _output
 
 
 __all__ = ["run"]

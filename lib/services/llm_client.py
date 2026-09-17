@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import json
 import re
+from contextvars import ContextVar
 from typing import Any
 
 from lib.utils.retry import retry_on_exception
+
+LLM_TIMEOUT_OVERRIDE: ContextVar[float | None] = ContextVar("llm_timeout_override", default=None)
 
 
 def _resolve_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -90,7 +93,7 @@ def call_llm(
         ),
     }
 
-    data = _post_json(url, payload, headers, timeout, max_retries)
+    data = _post_json(url, payload, headers, LLM_TIMEOUT_OVERRIDE.get() or timeout, max_retries)
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     if not content:
         raise RuntimeError("LLM вернул пустой ответ")
@@ -138,6 +141,15 @@ def call_llm_json(
         return None
 
     return _parse_json_object(text)
+
+
+def call_llm_json_strict(messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    """Shared JSON boundary which preserves transport and parsing failures."""
+    text = call_llm(messages, **kwargs)
+    result = _parse_json_object(text)
+    if result is None:
+        raise ValueError("LLM response is not a JSON object")
+    return result
 
 
 

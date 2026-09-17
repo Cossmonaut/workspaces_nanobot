@@ -13,24 +13,11 @@
 from __future__ import annotations
 
 import hashlib
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Добавляем пути в sys.path для импорта.
-_SKILL_ROOT = Path(__file__).resolve().parent.parent
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-_REPO_ROOT = _SKILL_ROOT.parents[2]
-_LS_SCRIPTS = str(_REPO_ROOT / "workspace" / "skills" / "legal_summarizer" / "scripts")
-
-# Добавляем пути
-_paths = [str(_SCRIPTS_DIR), str(_REPO_ROOT), _LS_SCRIPTS]
-for _p in _paths:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from vnd_chunking import vnd_chunker  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.vnd_chunking import vnd_chunker
 
 
 __all__ = ["VndInputError", "VndBundle", "prepare_vnd", "build_cache_key"]
@@ -118,7 +105,7 @@ def prepare_vnd(
         )
 
     # 3. Оценка размера (для --estimate-only и пользовательского UI).
-    size_estimate = vnd_chunker.estimate_vnd_size(vnd_paths)
+    size_estimate = vnd_chunker.estimate_chunks(chunks, len(vnd_paths))
 
     # 4. Cache key.
     cache_key = build_cache_key(violation=violation, vnd_paths=vnd_paths)
@@ -150,4 +137,9 @@ def build_cache_key(*, violation: str, vnd_paths: list[str]) -> str:
     for p in sorted(vnd_paths):
         h.update(b"\x00")
         h.update(p.encode("utf-8", errors="replace"))
+        with Path(p).open("rb") as source:
+            digest = hashlib.sha256()
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        h.update(digest.digest())
     return h.hexdigest()

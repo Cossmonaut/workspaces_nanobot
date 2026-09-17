@@ -32,7 +32,6 @@ def _ensure_repo_paths() -> None:
     # Пути, которые нужны skill'ам для импорта
     paths_to_add = [
         str(repo_root),  # lib/*, config.py, etc.
-        str(repo_root / "workspace" / "skills" / "legal_summarizer" / "scripts"),  # llm/*, chunking/*
     ]
     for p in paths_to_add:
         if p not in sys.path:
@@ -56,7 +55,6 @@ def _ensure_repo_paths() -> None:
     # Пути, которые нужны skill'ам для импорта
     paths_to_add = [
         str(repo_root),  # lib/*, config.py, etc.
-        str(repo_root / "workspace" / "skills" / "legal_summarizer" / "scripts"),  # llm/*, chunking/*
     ]
     for p in paths_to_add:
         if p not in sys.path:
@@ -193,7 +191,20 @@ def mock_llm_synthesize():
 
     def _patch(system: str, user: str, operation: str) -> dict[str, Any]:
         if operation == "synthesize":
-            return dict(canned)
+            payload = json.loads(
+                system.rsplit("## Релевантные фрагменты ВНД (от search-фазы)", 1)[1]
+            )
+            response = dict(canned)
+            if payload:
+                evidence = payload[0]
+                response["vnd_citations"] = [{
+                    "evidence_id": evidence["evidence_id"],
+                    "excerpt": evidence["text_excerpt"],
+                    "relation_explanation": "Прямое противоречие.",
+                }]
+            else:
+                response["vnd_citations"] = []
+            return response
         raise RuntimeError(f"Unexpected operation in mock: {operation}")
 
     return _patch
@@ -270,7 +281,7 @@ def mock_prepare_vnd(sample_vnd_chunks):
     from pathlib import Path
     _SKILL_ROOT = Path(__file__).resolve().parent.parent
     _SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-    for _p in [str(_SCRIPTS_DIR), str(_SKILL_ROOT.parent.parent.parent), str(_SKILL_ROOT.parent.parent / "workspace" / "skills" / "legal_summarizer" / "scripts")]:
+    for _p in [str(_SCRIPTS_DIR), str(_SKILL_ROOT.parent.parent.parent)]:
         if _p not in sys.path:
             sys.path.insert(0, _p)
 

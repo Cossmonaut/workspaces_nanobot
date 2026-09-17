@@ -85,6 +85,8 @@ SOUL.md
 USER.md
 memory/
 prompts/
+!workspace/skills/audit_formulation_strengthener/prompts/
+!workspace/skills/audit_formulation_strengthener/prompts/*.md
 workspace/cron/
 workspace/memory/.cursor
 

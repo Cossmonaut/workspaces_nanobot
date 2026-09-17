@@ -8,16 +8,11 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _PROMPTS_DIR = _SKILL_ROOT / "prompts"
-
-if str(_SKILL_ROOT / "scripts") not in sys.path:
-    sys.path.insert(0, str(_SKILL_ROOT / "scripts"))
-
 
 __all__ = ["load_prompt", "render_prompt"]
 

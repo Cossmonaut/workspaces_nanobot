@@ -124,9 +124,9 @@ python .../cli.py --mode synthesize \
 - `scripts/cli.py` — CLI entry point, маршрутизация режимов.
 - `scripts/skill_config.py` — обёртки `lib.core.skill_config`.
 - `scripts/output.py` — формат `{mode, status, data}` + `make_error`.
-- `scripts/llm.py` — single-flight LLM-вызовы + JSON retry.
+- `scripts/llm_client.py` — тонкий adapter общего LLM-клиента и single-flight boundary.
 - `scripts/vnd_io.py` — multi-file извлечение текста ВНД + чанкование (этап 3).
-- `scripts/chunking/vnd_chunker.py` — обёртка над `DocumentStructureChunker` из `legal_summarizer` (этап 3).
+- `scripts/chunking/vnd_chunker.py` — adapter общего `lib.services.document_processing` (этап 3).
 - `scripts/modes/analyze.py` — нормализация отклонения (этап 4).
 - `scripts/modes/search.py` — поиск релевантных фрагментов ВНД (этап 5).
 - `scripts/modes/synthesize.py` — финальный отчёт (этапы 6–7).
@@ -139,7 +139,7 @@ python .../cli.py --mode synthesize \
 
 - ❌ **НЕ вызывать `workspace.utils.office_files.extract_text()` напрямую** — это I/O-утилита, skill сам извлекает текст.
 - ❌ Не делать LLM-анализ отклонения самостоятельно — только через `cli.py`.
-- ❌ Не вызывать `DocumentStructureChunker` напрямую (импорты через `skill.scripts.chunking`).
+- ❌ Не вызывать общий document pipeline напрямую: его входной контракт принадлежит CLI skill'а.
 - ❌ Не интерпретировать `status="confirmation_required"` как готовый результат — нужен явный выбор пользователя.
 - ❌ Не вызывать skill «в цикле» (`--confirm` → `status=partial` → ещё раз `--confirm`).
 

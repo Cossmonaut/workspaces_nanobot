@@ -11,15 +11,10 @@ delivery здесь не дублируются: skill работает толь
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_ROOT = _SKILL_ROOT.parents[1]
-
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from lib.core import skill_config as _lib  # noqa: E402
 

@@ -129,6 +129,11 @@ def get_max_retries(skill_name: str) -> int:
     return int(cli_cfg.get("max_retries", 3))
 
 
+def get_execution_config(skill_name: str) -> dict[str, Any]:
+    """Existing execution settings shared by skill-side adapters."""
+    return dict(_skill_cfg(skill_name).get("execution") or {})
+
+
 def get_chunking_config(skill_name: str) -> dict[str, Any]:
     """Параметры map-reduce чанкинга из ``skills.<name>.chunking.*``.
 

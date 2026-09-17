@@ -51,12 +51,13 @@ from typing import Any
 # импортировались и без выставленного PYTHONPATH.
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
-_PROJECT_ROOT = str(_SKILL_ROOT.parents[1])
+_PROJECT_ROOT = str(_SKILL_ROOT.parents[2])
 for _p in (_PROJECT_ROOT, _SCRIPTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import output as _output  # noqa: E402
+from lib.services.llm_client import LLM_TIMEOUT_OVERRIDE
 from skill_config import get_cli_config  # noqa: E402
 
 
@@ -116,7 +117,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vnd",
         action="append",
-        required=True,
         dest="vnd_paths",
         help=(
             "Путь к файлу ВНД (.pdf/.docx/.txt). "
@@ -247,6 +247,7 @@ def _run_search(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
 def _run_search_with_analyze(
     args: argparse.Namespace,
     analyze_result: dict[str, Any],
+    prepared_bundle: Any = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Режим search с уже готовым результатом analyze (in-memory)."""
     from modes import search as search_mode  # noqa: WPS433
@@ -258,6 +259,7 @@ def _run_search_with_analyze(
         estimate_only=args.estimate_only,
         confirm=args.confirm,
         max_chunks=args.max_chunks,
+        prepared_bundle=prepared_bundle,
     )
 
 
@@ -271,19 +273,34 @@ def _run_synthesize(args: argparse.Namespace) -> tuple[dict[str, Any], str | Non
         analyze_result_path=args.analyze_result,
         search_result_path=args.search_result,
         output_format=args.output_format,
-        output_path=args.output,
+        output_path=args.output if args.internal_format == "report" else None,
+        estimate_only=args.estimate_only,
     )
 
 
 def _run_all(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
     """Полный пайплайн: analyze → search → synthesize."""
+    from modes import search as search_mode
+    from vnd_io import VndInputError
+    try:
+        bundle = search_mode.prepare_vnd(vnd_paths=list(args.vnd_paths), violation=args.violation)
+    except VndInputError as exc:
+        return _output.make_error(exc.message, error_type=exc.error_type), None
+    preflight, _ = search_mode.run(
+        violation=args.violation, vnd_paths=list(args.vnd_paths), estimate_only=True,
+        confirm=args.confirm, max_chunks=args.max_chunks, prepared_bundle=bundle,
+    )
+    if args.estimate_only or preflight.get("status") != "success":
+        return preflight, None
+    if preflight["data"]["confirmation_required"]:
+        return {"status": "confirmation_required", "data": preflight["data"]}, None
     # analyze (этап 4) — реальный LLM.
     analyze_result, _ = _run_analyze(args)
     if analyze_result.get("status") != "success":
         return analyze_result, None
 
     # search (этап 5) — map-reduce с уже готовым analyze.
-    search_result, _ = _run_search_with_analyze(args, analyze_result)
+    search_result, _ = _run_search_with_analyze(args, analyze_result, bundle)
     if search_result.get("status") != "success":
         return search_result, None
 
@@ -296,13 +313,16 @@ def _run_all(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
         analyze_result=analyze_result,
         search_result=search_result,
         output_format=args.output_format,
-        output_path=args.output,
+        output_path=args.output if args.internal_format == "report" else None,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    args.vnd_paths = args.vnd_paths or []
+    if args.mode in ("search", "all") and not args.vnd_paths:
+        parser.error("--vnd обязателен для search и all")
 
     # Регистрация skill в TableRegistry (для standalone-CLI; в runtime
     # это делает ApplicationContext._auto_register_skills).
@@ -321,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit(err, target_path=args.output, is_report=False)
         return 2
 
+    timeout_token = LLM_TIMEOUT_OVERRIDE.set(float(args.timeout))
     try:
         if args.mode == "analyze":
             result, report_text = _run_analyze(args)
@@ -346,9 +367,13 @@ def main(argv: list[str] | None = None) -> int:
         print(err, file=sys.stderr)
         _emit(err, target_path=args.output, is_report=False)
         return 1
+    finally:
+        LLM_TIMEOUT_OVERRIDE.reset(timeout_token)
 
     # Решаем, что отдавать пользователю
-    if report_text is not None and args.internal_format == "report":
+    if result.get("saved_to") and args.internal_format == "report":
+        _emit({"status": result["status"], "saved_to": result["saved_to"]}, target_path=None, is_report=False)
+    elif report_text is not None and args.internal_format == "report":
         _emit(report_text, target_path=args.output, is_report=True)
     else:
         _emit(result, target_path=args.output, is_report=False)

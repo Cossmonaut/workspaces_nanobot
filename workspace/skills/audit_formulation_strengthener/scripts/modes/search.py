@@ -3,8 +3,7 @@
 Реализация этапа 5: чистый LLM map-reduce.
 
 Алгоритм:
-1. ``prepare_vnd`` (этап 3) — извлечь все чанки ВНД через
-   ``DocumentStructureChunker`` из ``legal_summarizer``.
+1. ``prepare_vnd`` — извлечь все чанки ВНД через общий document pipeline.
 2. **Map-фаза:** для каждого чанка — 1 LLM-вызов с промптом
    ``prompts/search_chunk_system.md``. LLM возвращает
    ``{relation_type, relevance_score, why_matches}``.
@@ -13,9 +12,7 @@
    (``TOP_K_CANDIDATES``).
 5. Возвращаем JSON со списком ``vnd_findings`` + метаданными.
 
-Single-flight защита — все LLM-вызовы проходят через ``guarded_chat``
-из ``legal_summarizer.scripts.llm.single_flight`` (см. ``scripts.llm``),
-что исключает параллельные вызовы внутри одного процесса.
+Single-flight защита предоставляется общим LLM boundary из ``lib/services``.
 
 Skill-specific параметры (не вынесены в ``project.json::skills.*`` —
 не поддерживаются ``SkillSettings(extra="forbid")``):
@@ -25,21 +22,16 @@ Skill-specific параметры (не вынесены в ``project.json::skil
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import math
 from typing import Any
+from lib.services.document_processing.evaluation import map_chunks
+from lib.services.document_processing.evidence import evidence_id
+from workspace.skills.audit_formulation_strengthener.scripts.skill_config import get_execution_config
 
-# Добавляем scripts/ skill'а в sys.path.
-_SKILL_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-from llm_client import JsonParseError, call_llm_json  # type: ignore[import-not-found]  # noqa: E402
-from prompts import load_prompt, render_prompt  # type: ignore[import-not-found]  # noqa: E402
-from vnd_io import VndInputError, prepare_vnd  # type: ignore[import-not-found]  # noqa: E402
-
-import output as _output  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.llm_client import JsonParseError, call_llm_json
+from workspace.skills.audit_formulation_strengthener.scripts.prompts import load_prompt, render_prompt
+from workspace.skills.audit_formulation_strengthener.scripts.vnd_io import VndInputError, prepare_vnd
+from workspace.skills.audit_formulation_strengthener.scripts import output as _output
 
 
 __all__ = ["run"]
@@ -67,6 +59,7 @@ def run(
     estimate_only: bool = False,
     confirm: bool = False,
     max_chunks: int | None = None,
+    prepared_bundle: Any = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Поиск релевантных фрагментов ВНД (map-reduce через LLM).
 
@@ -101,13 +94,16 @@ def run(
 
     # Подготовка ВНД.
     try:
-        bundle = prepare_vnd(
+        bundle = prepared_bundle or prepare_vnd(
             vnd_paths=vnd_paths,
             violation=violation,
-            max_chunks_per_file=max_chunks,
         )
     except VndInputError as exc:
         return _output.make_error(exc.message, error_type=exc.error_type), None
+    limit = max_chunks if max_chunks is not None else get_execution_config().get("max_chunks_for_execution")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+        return _output.make_error("Лимит чанков должен быть положительным целым числом", error_type="invalid_limit"), None
+    needs_confirmation = limit is not None and len(bundle.chunks) > limit and not confirm
 
     # Estimate-only — без LLM.
     if estimate_only:
@@ -117,6 +113,7 @@ def run(
                 "data": {
                     "vnd_files": len(vnd_paths),
                     "vnd_chunks_total": len(bundle.chunks),
+                    "confirmation_required": needs_confirmation,
                     "cache_key": bundle.cache_key,
                     "size_estimate": bundle.size_estimate,
                     "top_k_candidates": TOP_K_CANDIDATES,
@@ -128,6 +125,12 @@ def run(
             None,
         )
 
+    if needs_confirmation:
+        return {"status": "confirmation_required", "data": {
+            "vnd_chunks_total": len(bundle.chunks), "max_chunks_for_execution": limit,
+            "message": "Для обработки всех фрагментов требуется --confirm. Текст не усечён.",
+        }}, None
+
     # === Map-фаза: по одному LLM-вызову на чанк ===
     try:
         template = load_prompt("search_chunk_system")
@@ -137,12 +140,7 @@ def run(
             error_type="prompt_missing",
         ), None
 
-    findings: list[dict[str, Any]] = []
-    chunks_processed = 0
-    chunks_failed = 0
-
-    for vnd_chunk in bundle.chunks:
-        chunks_processed += 1
+    def evaluate(vnd_chunk: Any) -> dict[str, Any] | None:
         system = render_prompt(
             template,
             {
@@ -151,30 +149,28 @@ def run(
                 "VND_SECTION": vnd_chunk.section_title
                 or vnd_chunk.section_path
                 or "(без заголовка)",
-                "CHUNK_TEXT": _truncate(vnd_chunk.text, max_chars=8000),
+                "CHUNK_TEXT": vnd_chunk.text,
             },
         )
-        try:
-            parsed = call_llm_json(
-                system=system,
-                user=f"Отклонение: {normalized_violation}",
-                operation="search_map",
-            )
-            finding = _normalize_finding(parsed, vnd_chunk=vnd_chunk)
-        except (JsonParseError, Exception) as exc:  # noqa: BLE001
-            # Один неудачный чанк не должен ронять весь прогон.
-            chunks_failed += 1
-            continue
+        parsed = call_llm_json(system=system, user=f"Отклонение: {normalized_violation}", operation="search_map")
+        return _normalize_finding(parsed, vnd_chunk=vnd_chunk)
 
-        if finding is None:
-            chunks_failed += 1
-            continue
-
-        # Отбрасываем нерелевантные.
-        if finding["relevance_score"] < MIN_RELEVANCE_SCORE:
-            continue
-
-        findings.append(finding)
+    mapped = map_chunks(bundle.chunks, evaluate)
+    if mapped.failures:
+        error = _output.make_error(
+            "Не все фрагменты ВНД обработаны. Синтез отчёта заблокирован.",
+            error_type="incomplete_search",
+        )
+        error["data"].update(chunks_processed=mapped.processed,
+                             chunks_failed=len(mapped.failures), failed_chunks=mapped.failures)
+        return error, None
+    findings = [
+        finding for finding in mapped.values
+        if finding["relevance_score"] >= MIN_RELEVANCE_SCORE
+        and finding["relation_type"] != "нерелевантно"
+    ]
+    chunks_processed = mapped.processed
+    chunks_failed = 0
 
     # === Re-rank: сортировка по score, top-K ===
     findings.sort(key=lambda f: f["relevance_score"], reverse=True)
@@ -249,6 +245,8 @@ def _normalize_finding(
         score = float(parsed.get("relevance_score"))
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(score) or not 0 <= score <= 1:
+        return None
     # clamp 0..1
     score = max(0.0, min(1.0, score))
 
@@ -257,11 +255,13 @@ def _normalize_finding(
         why = str(why)
 
     return {
+        "evidence_id": evidence_id(vnd_chunk.source_file, vnd_chunk.index, vnd_chunk.text),
         "source_file": vnd_chunk.source_file,
         "chunk_index": vnd_chunk.index,
         "section_title": vnd_chunk.section_title,
         "section_path": vnd_chunk.section_path,
-        "text_excerpt": _truncate(vnd_chunk.text, max_chars=2000),
+        "text_excerpt": vnd_chunk.text,
+        "provenance": getattr(vnd_chunk, "provenance", {}),
         "relation_type": relation_type,
         "relevance_score": round(score, 3),
         "why_matches": why.strip(),

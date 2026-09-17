@@ -37,21 +37,14 @@
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from lib.services.document_processing.evidence import evidence_id, resolve_citations
 
-# Добавляем scripts/ skill'а в sys.path.
-_SKILL_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-from llm_client import JsonParseError, call_llm_json  # type: ignore[import-not-found]  # noqa: E402
-from prompts import load_prompt, render_prompt  # type: ignore[import-not-found]  # noqa: E402
-
-import output as _output  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.llm_client import JsonParseError, call_llm_json
+from workspace.skills.audit_formulation_strengthener.scripts.prompts import load_prompt, render_prompt
+from workspace.skills.audit_formulation_strengthener.scripts import output as _output
 
 
 __all__ = ["run"]
@@ -64,7 +57,7 @@ _ALLOWED_RELATIONS = frozenset({
     "контекст",
     "нерелевантно",
 })
-_ALLOWED_CATEGORIES = frozenset({"высокая", "средняя", "низкая"})
+_ALLOWED_CATEGORIES = frozenset({"высокая", "средняя", "низкая", "требует уточнения"})
 
 
 def run(
@@ -97,8 +90,16 @@ def run(
         markdown-рендер отчёта (для CLI).
     """
     # Загрузить данные из файлов, если in-memory не передан.
-    analyze_data = _load_json(analyze_result, analyze_result_path)
-    search_data = _load_json(search_result, search_result_path)
+    try:
+        analyze_data = _load_json(analyze_result, analyze_result_path)
+        search_data = _load_json(search_result, search_result_path)
+    except (OSError, ValueError) as exc:
+        return _output.make_error(f"Не удалось загрузить промежуточные результаты: {exc}", error_type="invalid_resume"), None
+    for stage in (analyze_data, search_data):
+        if stage is not None and stage.get("status", "success") != "success":
+            return _output.make_error("Нельзя синтезировать отчёт из неуспешного этапа", error_type="incomplete_search"), None
+    if search_data and (search_data.get("data") or {}).get("chunks_failed", 0):
+        return _output.make_error("Поиск обработал не все фрагменты ВНД", error_type="incomplete_search"), None
 
     if estimate_only:
         return (
@@ -143,7 +144,28 @@ def run(
     if search_data and isinstance(search_data, dict):
         vnd_findings = (search_data.get("data") or {}).get("vnd_findings") or []
     if not isinstance(vnd_findings, list):
-        vnd_findings = []
+        return _output.make_error("Неверный формат результатов поиска", error_type="schema_mismatch"), None
+
+    if search_result_path:
+        from workspace.skills.audit_formulation_strengthener.scripts.vnd_io import prepare_vnd, VndInputError
+        try:
+            bundle = prepare_vnd(vnd_paths or [], violation=violation)
+            if (search_data or {}).get("data", {}).get("cache_key") != bundle.cache_key:
+                raise ValueError("Исходные документы или формулировка изменились")
+            originals = {(ch.source_file, ch.index): ch for ch in bundle.chunks}
+            for finding in vnd_findings:
+                original = originals.get((finding.get("source_file"), finding.get("chunk_index")))
+                if original is None or finding.get("text_excerpt") != original.text:
+                    raise ValueError("Фрагмент поиска не совпадает с исходным документом")
+                finding.update(section_title=original.section_title, section_path=original.section_path,
+                               provenance=original.provenance)
+        except (VndInputError, ValueError, TypeError, AttributeError) as exc:
+            return _output.make_error(f"Кэш поиска не прошёл проверку: {exc}", error_type="invalid_resume"), None
+
+    try:
+        prompt_findings = _prepare_findings_for_prompt(vnd_findings)
+    except (ValueError, TypeError, KeyError) as exc:
+        return _output.make_error(f"Неверные доказательства: {exc}", error_type="schema_mismatch"), None
 
     # Загрузить промпт.
     try:
@@ -163,7 +185,7 @@ def run(
                 key_concepts, ensure_ascii=False, indent=2
             ),
             "VND_FINDINGS_JSON": json.dumps(
-                _prepare_findings_for_prompt(vnd_findings),
+                prompt_findings,
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -176,7 +198,15 @@ def run(
             system=system,
             user=f"Отклонение: {normalized}",
             operation="synthesize",
-        )
+        ) if prompt_findings else {
+            "title": "Анализ отклонения: недостаточно данных",
+            "violation_summary": [normalized],
+            "established_facts": ["Релевантные фрагменты ВНД не найдены."],
+            "deviation_analysis": ["Недостаточно нормативных оснований для подтверждения нарушения."],
+            "vnd_citations": [],
+            "verdict": {"category": "требует уточнения", "verdict_text": ["Требуется уточнение нормативных оснований."]},
+            "recommended_formulation": ["Усиление формулировки не представляется возможным без релевантных фрагментов ВНД."],
+        }
     except JsonParseError as exc:
         return _output.make_error(
             f"LLM вернул невалидный JSON после всех попыток: {exc}",
@@ -193,7 +223,7 @@ def run(
         parsed,
         normalized_violation=normalized,
         severity=severity,
-        vnd_findings=vnd_findings,
+        vnd_findings=prompt_findings,
     )
     if data is None:
         return _output.make_error(
@@ -217,6 +247,7 @@ def run(
         if target.suffix.lstrip(".").lower() != ext:
             target = target.with_suffix(f".{ext}")
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
             if ext == "md":
                 target.write_text(md_text, encoding="utf-8")
             elif ext == "txt":
@@ -252,13 +283,15 @@ def _load_json(
     path: str | None,
 ) -> dict[str, Any] | None:
     """Загрузить JSON из in-memory или из файла."""
-    if inline:
+    if inline is not None:
+        if not isinstance(inline, dict):
+            raise ValueError("Промежуточный результат должен быть JSON-объектом")
         return inline
     if path:
-        try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("data"), dict):
+            raise ValueError("Промежуточный результат должен содержать объект data")
+        return loaded
     return None
 
 
@@ -269,13 +302,25 @@ def _prepare_findings_for_prompt(
     out: list[dict[str, Any]] = []
     for f in findings:
         if not isinstance(f, dict):
-            continue
+            raise ValueError("Фрагмент должен быть объектом")
+        source = f.get("source_file")
+        text = f.get("text_excerpt")
+        index = f.get("chunk_index", 0)
+        if not isinstance(source, str) or not source or not isinstance(text, str) or not text:
+            raise ValueError("Фрагмент не содержит источника или текста")
+        identifier = evidence_id(source, index, text)
+        if f.get("evidence_id", identifier) != identifier:
+            raise ValueError("Идентификатор доказательства не соответствует его тексту")
         out.append(
             {
+                "evidence_id": identifier,
+                "chunk_index": index,
+                "text_excerpt": text,
+                "provenance": f.get("provenance", {}),
                 "source_file": str(f.get("source_file") or ""),
                 "section_title": str(f.get("section_title") or ""),
                 "section_path": str(f.get("section_path") or ""),
-                "excerpt": str(f.get("text_excerpt") or "")[:1500],
+                "excerpt": text,
                 "relation_type": str(f.get("relation_type") or ""),
                 "relevance_score": float(f.get("relevance_score") or 0.0),
                 "why_matches": str(f.get("why_matches") or ""),
@@ -294,6 +339,12 @@ def _normalize_synthesize_payload(
     """Привести ответ LLM к финальному формату отчёта."""
     if not isinstance(parsed, dict):
         return None
+    try:
+        citations = resolve_citations(parsed.get("vnd_citations", []), vnd_findings)
+    except (ValueError, TypeError, KeyError):
+        return None
+    if vnd_findings and not citations:
+        return None
 
     title = str(parsed.get("title") or "Анализ отклонения").strip()
     if not title:
@@ -304,7 +355,7 @@ def _normalize_synthesize_payload(
         "violation_summary": _ensure_str_list(parsed.get("violation_summary")),
         "established_facts": _ensure_str_list(parsed.get("established_facts")),
         "deviation_analysis": _ensure_str_list(parsed.get("deviation_analysis")),
-        "vnd_citations": _normalize_citations(parsed.get("vnd_citations")),
+        "vnd_citations": citations,
         "verdict": _normalize_verdict(parsed.get("verdict"), fallback_severity=severity),
         "recommended_formulation": _ensure_str_list(parsed.get("recommended_formulation")),
         "normalized_violation": normalized_violation,

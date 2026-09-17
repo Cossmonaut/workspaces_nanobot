@@ -41,3 +41,10 @@ python workspace/skills/audit_formulation_strengthener/scripts/cli.py \
 - [`references/architecture.md`](references/architecture.md) — архитектура.
 - [`references/contracts.md`](references/contracts.md) — JSON-контракты режимов.
 - [`references/testing.md`](references/testing.md) — тестовая инфраструктура.
+
+## Гарантии доказательств
+
+Ссылки в отчёте не принимаются на доверии к LLM. Каждый найденный фрагмент
+получает программный идентификатор доказательства; итоговая цитата должна
+дословно входить в этот фрагмент. Неполная обработка ВНД или подмена результата
+поиска останавливают построение отчёта.

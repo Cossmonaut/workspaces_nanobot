@@ -47,6 +47,7 @@ def test_synthesize_full_with_mocks(mock_llm_synthesize) -> None:
             "vnd_findings": [
                 {
                     "source_file": "vnd1.txt",
+                    "chunk_index": 0,
                     "section_title": "5.4",
                     "section_path": "5 / 5.4",
                     "text_excerpt": "Срок хранения ПДн — не менее 5 лет.",
@@ -178,7 +179,7 @@ def test_synthesize_save_to_docx(mock_llm_synthesize, tmp_path: Path) -> None:
     assert target.stat().st_size > 1000  # не пустой
 
 
-def test_synthesize_load_from_file(
+def test_synthesize_resume_requires_source_documents(
     mock_llm_synthesize, tmp_path: Path
 ) -> None:
     """Загрузка analyze/search из файлов."""
@@ -200,13 +201,12 @@ def test_synthesize_load_from_file(
             search_result_path=str(s_file),
         )
 
-    assert result["status"] == "success"
-    assert result["data"]["normalized_violation"] == "FROM FILE"
-    assert result["data"]["severity"] == "низкая"
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "invalid_resume"
 
 
-def test_synthesize_invalid_citation_relation_normalized(mock_llm_synthesize) -> None:
-    """Невалидный relation_type в citations → ``контекст``."""
+def test_synthesize_rejects_unknown_citation_evidence(mock_llm_synthesize) -> None:
+    """Модель не может указать ссылку вне переданных доказательств."""
     from modes import synthesize
 
     def bad_citations(system, user, operation):
@@ -224,7 +224,22 @@ def test_synthesize_invalid_citation_relation_normalized(mock_llm_synthesize) ->
 
     with pytest.MonkeyPatch.context() as m:
         m.setattr(synthesize, "call_llm_json", bad_citations)
-        result, _ = synthesize.run(violation="что-то")
+        result, _ = synthesize.run(
+            violation="что-то",
+            search_result={
+                "status": "success",
+                "data": {"vnd_findings": [{
+                    "source_file": "vnd.txt",
+                    "chunk_index": 0,
+                    "section_title": "1",
+                    "section_path": "1",
+                    "text_excerpt": "Требование ВНД.",
+                    "relation_type": "контекст",
+                    "relevance_score": 0.5,
+                    "why_matches": "x",
+                }]},
+            },
+        )
 
-    assert result["status"] == "success"
-    assert result["data"]["vnd_citations"][0]["relation_type"] == "контекст"
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "schema_mismatch"

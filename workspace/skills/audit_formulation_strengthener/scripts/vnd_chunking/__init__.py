@@ -1,1 +1,1 @@
-"""Чанкование ВНД — обёртки над DocumentStructureChunker из legal_summarizer."""
+"""Adapter обработки ВНД над общим document-processing service."""
