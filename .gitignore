@@ -84,7 +84,7 @@ HEARTBEAT.md
 SOUL.md
 USER.md
 memory/
-prompts/
+/prompts/
 workspace/cron/
 workspace/memory/.cursor
 

@@ -308,10 +308,17 @@
     //  На входе: текст отклонения + один/несколько файлов ВНД (.pdf/.docx/.txt).
     //  На выходе: человекочитаемый отчёт (.md/.docx/.txt) в строгом
     //  русском юридическом стиле.
+    //
     //  Извлечение текста — workspace.utils.office_files.extract_text;
-    //  чанкование — DocumentStructureChunker из legal_summarizer (переиспользуется).
-    //  У skill'а нет PG-таблиц и vector-индексов (ВНД приходят файлами каждый
-    //  раз заново), поэтому tables[] и vector_indexes[] пусты.
+    //  чанкование — lib.services.text_splitter.split_text (без секций);
+    //  LLM-вызовы — lib.services.llm_client.call_llm через тонкую
+    //  обёртку scripts/llm.py.
+    //
+    //  У skill'а нет PG-таблиц и vector-индексов (ВНД приходят файлами
+    //  каждый раз заново), поэтому tables[] и vector_indexes[] пусты.
+    //
+    //  skill использует только ключи существующей SkillSettings-схемы
+    //  (extra="forbid"). Никаких новых ключей не введено.
     // -------------------------------------------------------------------------
     "audit_formulation_strengthener": {
       "enabled": true,
@@ -325,24 +332,18 @@
         "max_retries": 3                             // Retry при невалидном JSON от LLM.
       },
 
-      "llm": {                                       // Execution policy для skill'а.
+      "llm": {                                       // Параметры LLM-вызовов для skill'а.
         "max_tokens": 4096,
         "temperature": 0.1                           // Низкая температура для юридического стиля.
       },
 
-      "chunking": {                                  // Map-reduce пороги для длинных ВНД.
-                                                   // Источник истины для размера чанка —
-                                                   // chunk_size_input_ratio (доля от контекстного окна).
-        "chunk_size_input_ratio": 0.5,              // Доля контекстного окна под один чанк.
-        "chunk_size": 100000,                        // Fallback если ratio не задан/не применим.
-        "chunk_overlap": 0,                          // Overlap=0 — каждый чанк обрабатывается независимо.
-        "single_call_threshold": 20000               // Ниже — single-call, выше — map-reduce.
+      "chunking": {                                  // Размер/перекрытие чанков ВНД (для search-фазы).
+        "chunk_size": 6000,                          // Под LLM-вызов по одному чанку (map).
+        "chunk_overlap": 400
       },
 
-      "execution": {                                 // Пользовательский контроль + safety net.
-        "confirmation_threshold_sec": 120,           // Если estimated_duration_max_sec > этого,
-                                                   // skill возвращает confirmation_required и ждёт --confirm.
-        "max_chunks_for_execution": 50               // Safety net: chunks_total > этого → requires_continuation.
+      "execution": {                                 // Safety net для оценки размера.
+        "max_chunks_for_execution": 50               // chunks_total > этого → явная ошибка too_many_chunks.
       }
     }
   },
