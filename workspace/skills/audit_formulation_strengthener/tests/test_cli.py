@@ -123,6 +123,27 @@ def test_cli_missing_file_exits_2(mock_llm_all) -> None:
     assert payload["data"]["error_type"] == "vnd_not_found"
 
 
+def test_cli_missing_file_in_all_mode_fails_before_llm(mock_llm_all) -> None:
+    """Регрессия: в --mode all несуществующий ВНД ловится ДО LLM-вызова analyze.
+
+    Раньше валидация происходила только внутри search/prepare_vnd — после
+    analyze, из-за чего тратился LLM-вызов, а при недоступном LLM ошибка
+    маскировалась под llm_error (exit 1) вместо vnd_not_found (exit 2).
+    """
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "all",
+            "--violation", "x",
+            "--vnd", "/nonexistent/file.pdf",
+        ]
+    )
+    assert exit_code == 2
+    payload = json.loads(stdout)
+    assert payload["data"]["error_type"] == "vnd_not_found"
+    assert mock_llm_all.counter.chat_json_calls == 0
+
+
+
 # -----------------------------------------------------------------------------
 # estimate-only + --output → --output игнорируется (П6)
 # -----------------------------------------------------------------------------

@@ -307,6 +307,19 @@ def main(argv: list[str] | None = None) -> int:
             _emit(err, kind="json", target_path=None, mode=args.mode)
             return 2
 
+    # Несуществующие файлы ВНД → JSON vnd_not_found + exit 2 ДО любого
+    # LLM-вызова (иначе в режиме all ошибка всплыла бы только после
+    # analyze, потратив вызов и замаскировавшись под llm_error).
+    if args.vnd_paths:
+        missing = [p for p in args.vnd_paths if not Path(p).exists()]
+        if missing:
+            err = make_error(
+                f"Не найдены файлы ВНД: {', '.join(missing)}",
+                error_type="vnd_not_found",
+            )
+            _emit(err, kind="json", target_path=None, mode=args.mode)
+            return 2
+
     try:
         if args.mode == "analyze":
             result, report_text = _run_analyze(args)
