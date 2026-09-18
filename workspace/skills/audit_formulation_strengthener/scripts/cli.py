@@ -70,7 +70,21 @@ def _ensure_registered() -> None:
 
     В обычном runtime это делает ``ApplicationContext._auto_register_skills``.
     Идемпотентно.
+
+    ``SETTINGS`` — ``_LazySettings`` proxy, публикуемый через
+    ``config._initialize_settings(profile)`` (change ``config-profile-cli-flag``).
+    В standalone-CLI нет entrypoint'а, который бы его вызвал, поэтому
+    инициализируем здесь (default = test, тот же паттерн, что в других
+    standalone-CLI скиллов). Если proxy уже инициализирован (CLI внутри
+    gateway/cli_agent) — no-op.
     """
+    try:
+        import config as _cfg  # type: ignore[import-not-found]
+
+        if not _cfg.is_settings_initialized():
+            _cfg._initialize_settings(profile="test")
+    except Exception:  # noqa: BLE001
+        pass  # работа с файлами ВНД возможна и без настроенного профиля
     try:
         from config import SETTINGS  # type: ignore[import-not-found]
         from lib.core.skill_registration import (  # type: ignore[import-not-found]
@@ -291,10 +305,11 @@ def _run_all(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Инициализация SETTINGS должна произойти ДО _build_parser():
+    # get_cli_config() читает project.json через ленивый proxy.
+    _ensure_registered()
     parser = _build_parser()
     args = parser.parse_args(argv)
-
-    _ensure_registered()
 
     # Пустой --vnd → JSON no_vnd в stdout + exit 2
     # (а не argparse.SystemExit(2) с usage в stderr).

@@ -14,10 +14,38 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 # Корень репо — единственная точка модификации sys.path в test-инфраструктуре.
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+# =============================================================================
+# Lifecycle bootstrap (как в корневом tests/conftest.py)
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _bootstrap_config_lifecycle():
+    """Lazy-init ``config.SETTINGS`` (``_LazySettings`` proxy) для тестов скилла.
+
+    ``get_chunking_config``/``get_cli_config`` читают project.json через
+    ленивый proxy, который публикуется только ``_initialize_settings(profile)``
+    из application entrypoint. В pytest такого entrypoint нет — инициализируем
+    сами (profile="test"), идемпотентно: повторный init бросает
+    ``ConfigurationError``, который ловим.
+    """
+    import config
+
+    if not config.is_settings_initialized():
+        try:
+            config._initialize_settings(profile="test")
+        except config.ConfigurationError:
+            pass  # уже инициализировано — OK
+    yield
+
 
 
 # =============================================================================
