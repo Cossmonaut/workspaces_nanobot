@@ -91,14 +91,6 @@ class VectorIndexSettings(_StrictOptional):
         storage_table: единая PG-таблица-хранилище сырых эмбеддингов.
             Регистрируется в ``TableRegistry`` через ``register_infra``
             и попадает в DuckDB-кэш через ``PgDuckDbSyncService``.
-        signature_table: PG-таблица-хранилище сериализованных FAISS-индексов
-            (BYTEA + ``metadata`` JSONB со signature). Дефолт —
-            ``_DEFAULT_VECTOR_INDEX_STORE_TABLE`` в ``cache_provider_impl``
-            (DDL в ``sql/vectors/create_vector_index_store.sql``).
-            Используется ``DuckDbCacheStore._check_index_integrity`` и
-            ``build_cache_provider`` для проверки/записи signature; если
-            переименована через DDL — указать здесь, чтобы код не зависел
-            от хардкода.
         indexes: полный конфиг vector-индексов ``{имя: VectorIndexConfig}``
             (какие индексы строить, из каких source-таблиц, content_cols,
             embedding_cols, chunk-параметры, metric). Единственный источник
@@ -110,7 +102,6 @@ class VectorIndexSettings(_StrictOptional):
     default_root: str | None = None
     backend: str | None = None
     storage_table: str | None = None
-    signature_table: str | None = None
     indexes: dict[str, VectorIndexConfig] | None = None
 
 
@@ -246,6 +237,25 @@ class ChannelsSettings(_StrictOptional):
 
 class LoggingDbSettings(_StrictOptional):
     enabled: bool | None = None
+    flush_interval_sec: float | None = Field(default=None, ge=0.5, le=60.0)
+
+    @model_validator(mode="after")
+    def _default_flush_interval_sec(self) -> "LoggingDbSettings":
+        """Подменить ``None`` на канонический дефолт ``5.0``.
+
+        Спека change ``improve-history-search-pagination-and-logging``
+        требует, чтобы типизированная конфигурация была
+        **источником default-value** для ``flush_interval_sec``:
+        ``LoggingDbSettings().flush_interval_sec == 5.0``. Pydantic
+        ``default=None`` оставляет поле ``None``-able (что нужно для
+        семантики «отсутствующий ключ не ошибка»), но downstream-код
+        (``ApplicationContext``) получает ``5.0`` без явного fallback
+        на константу. Контракт: внутри сконструированной модели
+        ``None`` сюда не попадает.
+        """
+        if self.flush_interval_sec is None:
+            object.__setattr__(self, "flush_interval_sec", 5.0)
+        return self
 
 
 class LoggingSettings(_StrictOptional):

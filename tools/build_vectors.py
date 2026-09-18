@@ -84,8 +84,17 @@ from utils.db import configure, execute, fetch, resolve_dsn
 
 # Standalone-регистрация runtime-storage (для случая когда build_vectors.py
 # запущен без ApplicationContext). Подменяет ApplicationContext._register_infra_resources.
+# Здесь ``register_vector_storage`` обёрнут в try/except: без
+# ``config._initialize_settings(profile)`` proxy ``SETTINGS`` UNINITIALIZED,
+# а module-level импорт не должен ронять ``import tools.build_vectors``
+# (tests collection, ``tools/build_vectors.py`` как dependency от других
+# утилит). При реальном запуске standalone — ``main()`` ниже падает
+# fail-fast на первом обращении к ``SETTINGS``.
 from lib.core.infra_registration import register_vector_storage
-register_vector_storage()
+try:
+    register_vector_storage()
+except Exception:
+    pass
 
 
 def fetchone(sql, *args):
@@ -417,39 +426,48 @@ def _normalize_cols(embedding_cols: list) -> list[str]:
 
 
 def _rebuild_faiss(index_name: str, db_table: str, rebuilt_only_deletion: bool = False) -> None:
-    """Пересобрать FAISS-индекс через единый сервисный слой (vector_index_service).
+    """Прогреть FAISS-индекс в in-memory cache провайдера.
 
-    Инвалидирует кэш провайдера, читает векторы ``index_name`` из
-    ``db_table``, строит индекс и сохраняет blob в PG-таблицу-хранилище
-    (``read_vector_store_table()``; см. ``VectorIndexSettings.signature_table``).
+    После change ``remove-vector-index-store`` persisted FAISS-кеш
+    удалён. Этот шаг только прогревает ``provider.preload_indexes``
+    для текущего процесса (для CLI-режима); основной путь
+    search-сервера — startup-flow в ``gateway.py``.
+
     faiss/numpy отсутствуют — не фатально: векторы уже в БД, поиск просто
     будет недоступен до установки зависимостей.
     """
     try:
-        # ``VectorIndexBuildService`` использует ``build_cache_provider(cfg, base_dir)``,
-        # который читает storage_table из ``gateway.vector.index.*`` (через
-        # ``register_vector_storage``, вызванный при импорте). ``cfg={}`` —
-        # skill-independent; skill-name не должен попадать в CLI-утилиту.
-        svc = VectorIndexBuildService({}, str(_ROOT))
-        count = svc.rebuild_and_store(index_name, db_table)
+        from lib.services.cache_provider_impl import build_cache_provider
+
+        provider = build_cache_provider({}, str(_ROOT))
+        # Открываем кэш провайдера, чтобы ``preload_indexes`` мог читать
+        # из DuckDB-снапшота storage_table.
+        if hasattr(provider, "open_cache") and not getattr(provider, "_conn", None):
+            provider.open_cache()
+        loaded = provider.preload_indexes(db_table)
     except (ImportError, ModuleNotFoundError) as exc:
         logger.warning(f"  ПРЕДУПРЕЖДЕНИЕ: FAISS-индекс для '{index_name}' не собран — "
                        f"отсутствует зависимость ({exc.__class__.__name__}: {exc}). "
                        f"Поиск через vector_mode будет работать только после установки faiss-cpu + numpy.")
         return
     except Exception as exc:
-        logger.error(f"  ОШИБКА сборки FAISS-индекса для '{index_name}': "
+        logger.error(f"  ОШИБКА прогрева FAISS-индекса для '{index_name}': "
                      f"{exc.__class__.__name__}: {exc}\n{traceback.format_exc()}")
         return
+
+    count = next(
+        (it.get("vectors") for it in loaded if it.get("index_name") == index_name),
+        None,
+    )
     if count is None:
-        logger.warning(f"  FAISS-индекс '{index_name}' не пересобран: нет векторов в {db_table}")
+        logger.warning(f"  FAISS-индекс '{index_name}' не прогрет: нет векторов в {db_table}")
         return
     if rebuilt_only_deletion:
-        logger.info(f"  FAISS-индекс '{index_name}' пересобран (только удаление): {count} векторов")
+        logger.info(f"  FAISS-индекс '{index_name}' прогрет (только удаление): {count} векторов")
     else:
-        logger.success(f"  FAISS-индекс '{index_name}' собран в памяти и сохранён в "
-                       f"signature-store ({count} векторов; см. "
-                       f"gateway.vector.index.signature_table)")
+        logger.success(f"  FAISS-индекс '{index_name}' прогрет в памяти процесса "
+                       f"({count} векторов; собирается на лету из DuckDB-снапшота "
+                       f"gateway.vector.index.storage_table)")
 
 
 # =============================================================================
@@ -786,6 +804,16 @@ def _filter_unchanged(enabled: dict, db_table: str) -> dict:
 
 def main():
     import argparse
+
+    # После change ``config-profile-cli-flag`` ``SETTINGS`` — ``_LazySettings``
+    # proxy, опубликованный через ``_initialize_settings(profile)``. В
+    # standalone-utility (``build_vectors.py`` вызывается ad-hoc из CI или
+    # вручную) нет entrypoint, который бы это сделал, поэтому делаем
+    # здесь (default = test, fail-safe). Если уже инициализировано
+    # (например, через gateway/cli_agent) — этот вызов no-op.
+    import config as _cfg
+    if not _cfg.is_settings_initialized():
+        _cfg._initialize_settings(profile="test")
 
     parser = argparse.ArgumentParser(
         description="Сборка векторных индексов из исходных таблиц"

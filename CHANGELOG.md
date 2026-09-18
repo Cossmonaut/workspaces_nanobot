@@ -8,6 +8,279 @@
 
 ## [Unreleased]
 
+> **MAJOR-релиз:** удаление persisted FAISS-кеша. После change
+> `remove-vector-index-store` единственный источник векторных данных —
+> `<storage_table>` (DuckDB-снапшот через `PgDuckDbSyncService`); FAISS-индекс
+> собирается в памяти при старте gateway (`provider.preload_indexes`).
+>
+> **MAJOR-релиз:** единственный источник профиля конфигурации — CLI-флаг
+> `--profile` (см. `openspec/changes/config-profile-cli-flag`). Whitelist
+> закрытый: только `prod` и `test`. Env vars для передачи профиля
+> (исторически — `NANOBOT_PROFILE`) **полностью удалены** как
+> действующий механизм. Все три `application entrypoint`
+> (`gateway.py`, `cli_agent.py`, `streamlit_app.py`) без `--profile`
+> падают с `ConfigurationError` и `exit 2`. **BREAKING** для деплоев,
+> использующих env-based передачу профиля — требуется миграция на
+> `command: python gateway.py --profile=prod` (см. `docs/PROFILES.md`
+> § «Migration»).
+
+### Fixed
+
+- **Cancellation now reaches active nanobot task.** Команды `/stop`,
+  `/restart`, `/status` (все priority-команды из
+  `nanobot.command.router.CommandRouter`) теперь доходят до AgentLoop
+  даже когда все обычные слоты (`max_concurrent=1`/`2`/N) заняты
+  активной задачей той же сессии. Реализовано через **priority polling
+  path** в `MessageExchange._poll_loop` (новый опциональный хук канала
+  `poll_priority_inbound`), который вызывается до проверки
+  `is_slot_free()` и не зависит от обычного concurrency. Для
+  PostgresChannel добавлен метод `poll_priority_inbound` +
+  `_poll_priority_once`, использующий параметризованный
+  `_claim_one(priority_contents=...)`, где `priority_contents` —
+  список всех priority-команд из
+  `lib.channels.priority_commands.get_priority_commands()`
+  (читается из `CommandRouter._priority` с fallback на дефолт).
+  Фильтр в SQL: `AND content = ANY(%s)`. После доставки команды в
+  `bus.publish_inbound` работает штатный механизм nanobot:
+  `cmd_stop` → `_cancel_active_tasks(effective_key)` (или `cmd_restart`
+  / `cmd_status` для соответствующих команд). Подробности и
+  acceptance-матрица — в `docs/ARCHITECTURE.md` § «Priority polling
+  path (для priority-команд nanobot)».
+
+### Added
+
+- **DB safety net в polling**: фильтр `AND status != 'cancelled'` в
+  `_claim_one_single` (3 места: основной WHERE, подзапрос по соседним
+  задачам, финальный UPDATE) и в `_claim_one` (worker_pool) — если AW
+  пометил user-сообщение как `cancelled` ДО polling, polling его
+  пропускает (race-free).
+- **Race-check после claim**: повторный `fetchval` статуса в
+  `_poll_once` и `_poll_priority_once` — если между SELECT подзапроса
+  и UPDATE захвата AW пометил `cancelled`, polling не диспатчит и
+  освобождает claim + lease + локальный контекст.
+- **Drop response в `_finalize_turn`**: если user-сообщение стало
+  `cancelled` пока LLM работала, финальный ответ не публикуется;
+  освобождаются slot, claim, context bridge; assistant-placeholder
+  удаляется. Status user'а НЕ переписывается (он уже `cancelled` от AW).
+- **Priority polling contract** в `MessageExchange`:
+  `poll_priority_inbound` — опциональный async-хук канала, вызывается
+  в `_poll_loop` **до** `poll_inbound`. Если хук не реализован
+  каналом — default-поведение через `getattr(..., None)` (другие
+  каналы не ломаются).
+- **`lib.channels.priority_commands.get_priority_commands()`** —
+  единый источник списка priority-команд nanobot для транспорта.
+  Читает `CommandRouter._priority` (duck-typing через
+  `hasattr(..., 'priority_commands')` для будущей совместимости);
+  fallback — захардкоженный `_DEFAULT_PRIORITY_COMMANDS = (
+  '/stop', '/restart', '/status')`.
+- **Тесты**: `tests/test_user_stop_signal_priority.py` (19 тестов —
+  priority claim filter, dispatch без slot/chat_inflight/placeholder,
+  race-fix, структурные проверки `_poll_loop`); расширен
+  `tests/test_user_stop_signal.py` (DB safety net, finalize drop).
+- **Static-audit тест** `test_postgres_channel_static_audit.py::test_claim_one_routes_single_to_single_method`
+  обновлён под параметризованный `_claim_one_single(priority_contents=...)`.
+
+### Changed
+
+- **Vector-индекс собирается в памяти из DuckDB-снапшота** `gateway.vector.index.storage_table`
+  (синхронизируется через `PgDuckDbSyncService`). `provider.preload_indexes`
+  при старте gateway прогревает все индексы синхронно до сигнала `READY`;
+  пользовательские `search_vector` НЕ платят за cold-сборку. Если индекс
+  не прогрет — `search_vector` возвращает ошибку с понятным
+  `_search_error`, никакой ленивой сборки.
+- `build_faiss_index` (`lib/utils/duckdb_query.py`) больше не дублирует
+  `content` / `search_text` / `row_data` в JSONB-метаданных. `meta`
+  содержит только `{"metric": ..., "metadata": {<координаты чанков>}}`
+  (pk_value / chunk_index / chunk_count / table / source). Тяжёлый payload
+  подтягивается per-hit через DuckDB `SELECT content, search_text, row_data
+  FROM <storage_table> WHERE source = ? AND pk_value = ? AND chunk_index = ?`.
+- `compute_index_health` (`lib/services/preload_service.py`): `orphan`
+  берётся из DuckDB-снапшота `<storage_table>` (DISTINCT source) вместо
+  удалённой `agent_vector_index_store`; `stale` — из
+  `loaded_items[i]["signature_status"]` (inline-вычисленный при прогреве),
+  без чтения persisted `metadata.signature`.
+
+### Changed
+
+- **Профиль конфигурации теперь определяется только CLI-флагом
+  `--profile`** (whitelist: `prod`, `test`). Все три `application
+  entrypoint` (`gateway.py`, `cli_agent.py`, `streamlit_app.py`)
+  требуют обязательный `--profile` и без него падают с
+  `ConfigurationError` + `exit 2`. Env vars для передачи профиля
+  более не используются (исторически — `NANOBOT_PROFILE`); ни runtime
+  fallback, ни deploy descriptors (`docker-compose` / k8s / systemd /
+  GitHub Actions), ни активная документация. **BREAKING** для
+  существующих деплоев, использующих env-based передачу профиля —
+  требуется миграция на `command: python gateway.py --profile=prod`
+  (см. `docs/PROFILES.md` § «Migration»).
+- **`config._initialize_settings(profile)` — единственная точка
+  публикации `SETTINGS`.** После `import config` `SETTINGS` —
+  `_LazySettings` proxy, и любой доступ (`__getitem__` / `__getattr__`
+  / `.get`) поднимает `ConfigurationError`, пока
+  `config._initialize_settings(profile)` не отработает. Никакого
+  module-level `SETTINGS = resolve_application_config(...)`, никакого
+  default-профиля, никакого auto-init при чтении. Whitelist профилей
+  ужесточён: только `{"prod", "test"}` (раньше было regex
+  `[a-z0-9_-]+` — фактически любое имя; введение третьего профиля
+  требует отдельного OpenSpec change).
+- **`ApplicationContext.create(profile=...)`**: убрана избыточная
+  ctx-пересборка при `profile != _ACTIVE_PROFILE` (после change
+  `_ACTIVE_PROFILE` module-level global больше нет — `ApplicationContext`
+  просто читает уже инициализированный `SETTINGS` из `_LazySettings`).
+  Если caller вызвал `create` без предварительного entrypoint init —
+  `ConfigurationError` (`SETTINGS["profile"]` через proxy).
+- **Application subprocess получает профиль через argv, не через env.**
+  `lib.services.subprocess_manager.spawn_streamlit` теперь явно
+  добавляет `--profile=<SETTINGS["profile"]>` в argv child
+  `streamlit_app.py` (раньше child падал с
+  `ConfigurationError("--profile is required")` на module-level, и
+  Streamlit UI не стартовал). Подробности — `docs/INTERNAL_API.md`
+  § «Передача профиля в application subprocess».
+
+- **`history_search`: пагинация и честные truncation-флаги**
+  (`openspec/changes/improve-history-search-pagination-and-logging`).
+  Добавлен параметр `offset` (≥ 0, дефолт 0) и поля ответа `has_more` /
+  `next_offset` — продолжение пагинации через `offset = next_offset`,
+  а не через `offset + limit`, чтобы при `results_truncated=true` не
+  пропустить отброшенные события. SQL: `ORDER BY "timestamp" DESC,
+  "id" DESC LIMIT %s OFFSET %s` (детерминированный tie-breaker по
+  UUID `agent_gateway_logs.id` стабилен для равных `timestamp` в
+  одном батче flush'а); `LIMIT effective_limit + 1` даёт лишнюю
+  строку для детекции `db_has_more`. Разделены два разных механизма
+  truncation: `results_truncated` (на ответе — выброшены целые события,
+  чтобы влезть в `max_result_chars`) и `payload_truncated` (на каждом
+  событии — ужатие payload'а конкретного события через
+  `truncate_middle`). Старое поле `truncated` помечено **deprecated**
+  в пользу `results_truncated`; алиас удаляется в отдельном follow-up
+  change. `has_more = db_has_more OR results_truncated` — композитная
+  формула, гарантирующая что следующая страница остаётся видна даже
+  когда `LIMIT N+1` не нашёл следующей строки в БД, но часть
+  отобранных событий была отброшена truncation'ом.
+- **`db_logging_service`: диагностика `written_by_type` и
+  `oldest_queued_age_sec`** в `get_stats()`. `written_by_type: dict[str, int]`
+  инкрементируется **только** после успешного `_flush_batch` (не в
+  `_enqueue`); счётчик не сбрасывается при повторном `start()` —
+  lifetime эквивалентен lifetime экземпляра. `oldest_queued_age_sec`
+  — возраст самого старого `LogEvent` в очереди (`max(time.time()
+  - queued_at)`); учитываются только `LogEvent` (не
+  `_QuestionRunRecord` и не `_FlushSentinel`); пустая очередь или
+  очередь только из служебных объектов даёт `None`. `LogEvent.
+  queued_at: float | None` заполняется в `_enqueue` значением
+  `time.time()`.
+- **`logging.db.flush_interval_sec` в типизированной конфигурации**:
+  новое поле `LoggingDbSettings.flush_interval_sec: float | None`,
+  диапазон `0.5 ≤ value ≤ 60.0`, дефолт `5.0`. Значение передаётся
+  через `ConfigurationResolver` → `ProjectSettings` →
+  `ApplicationContext` → `DbLoggingService.__init__`; вне диапазона —
+  `pydantic.ValidationError` на старте `ApplicationContext.create`.
+  Сервис НЕ читает конфиг напрямую. См. `AGENTS.md` § «Configuration».
+
+### Removed
+
+- **Таблица `public.agent_vector_index_store`** (имя бралось из
+  `gateway.vector.index.signature_table`) — DDL помечен DEPRECATED,
+  миграция `sql/migrations/V003__drop_vector_index_store.sql` удаляет её.
+- **Настройка `gateway.vector.index.signature_table`** — поле
+  `VectorIndexSettings.signature_table` удалено; `ProjectSettings(**)`
+  отвергает её с ValidationError.
+- **Метод `PostgresDuckDbProvider.rebuild_and_store_index`** — удалён.
+- **Метод `PostgresDuckDbProvider._save_index_to_store`** — удалён.
+- **Метод `PostgresDuckDbProvider._load_index_from_store`** — удалён.
+- **Метод `PostgresDuckDbProvider._load_vectors_from_db`** — удалён
+  (использовался только для side-effect `_save_index_to_store`).
+- **Метод `PostgresDuckDbProvider._load_index_from_files`** — удалён
+  (`.faiss`-файлы больше не персистятся).
+- **Метод `PostgresDuckDbProvider._compute_index_signature_from_config`**
+  — удалён (signature вычисляется on-the-fly в `_check_index_signature`).
+- **`lib.services.vector_index_service.VectorIndexBuildService.rebuild_and_store`**
+  — удалён.
+- **Legacy `gateway.vector.index.default_root`** — упоминания в
+  документации помечены DEPRECATED; FAISS не персистится на диск.
+- **Module-level `_ACTIVE_PROFILE` global в `config.py`** — удалён
+  как действующий runtime-механизм. Канонический доступ к активному
+  профилю теперь — `SETTINGS["profile"]` (или `get_active_profile()`
+  поверх него).
+- **`config._resolve_mode()`** — удалена полностью. После удаления
+  env-чтения функция сводилась к whitelist-валидации, которая
+  встроена в `config._initialize_settings(profile)`.
+- **Env var для передачи профиля (исторически — `NANOBOT_PROFILE`)** —
+  полностью удалена как действующий runtime-механизм. Ни runtime
+  fallback, ни deploy descriptors (`docker-compose` / k8s / systemd /
+  GitHub Actions), ни активная документация не используют её.
+  Приложение просто не работает с такими env vars; их игнорирование —
+  отсутствие кода, который их читает, а не активный sanitization.
+  Деплои, использующие эту переменную, должны быть переведены на
+  `command: python gateway.py --profile=prod` (см. `docs/PROFILES.md`
+  § «Migration»).
+
+### Known Issues
+
+- **`tests/test_history_search_tool.py::test_search_current_session_filters_by_session`**:
+  order-dependent flake — патч `utils.db.fetch` ломается в полном прогоне
+  после `test_streamlit_app.py` (который переустанавливает `sys.modules["utils.db"]`
+  через собственный mock). Помечен `@pytest.mark.xfail(strict=False)` с TODO
+  на отдельный change. Pre-existing, не связан с config-profile-cli-flag.
+
+### Fixed
+
+- **Pre-existing regressions в legacy-тестах** (не связаны со спекой
+  `config-profile-cli-flag`, но блокировали зелёный pytest — чиним отдельным
+  commit'ом):
+  - `streamlit_app.py:93` — `decode_media_list` → `decode_json_list`
+    (старая функция удалена при рефакторинге медиа-кодека; 42 теста в
+    `test_streamlit_app.py` падали на collection с `ImportError`).
+  - `gateway.py:_entrypoint_main` — `UnboundLocalError` на `__logo__`/
+    `__version__`: импорты внутри `if args.smoke:` приводили к тому, что
+    Python считал имена локальными, но ветка else не имела своего
+    импорта. Импорты вынесены выше `if`. Регрессия в Phase B.
+  - `tests/test_config.py::TestLoadEnv` — 2 теста устарели после
+    CHANGELOG-фикса `load_env` (заголовок секции теперь требует `:`
+    после `#`); поправлены под текущее поведение.
+  - `tests/test_streamlit_app.py::mock_all`, `tests/test_gateway.py` —
+    mock `config` модуля дополнен `ConfigurationError` (Phase B импорт
+    на module-level) и `_initialize_settings = MagicMock()` (no-op,
+    чтобы autouse-fixture из `conftest.py` не упирался в
+    `already initialized`).
+  - `tests/test_gateway.py::TestMain::test_clean_shutdown` — patch
+    `lib.lifecycle.gateway_runner.GatewayRunner` вместо
+    `gateway.GatewayRunner` (Phase B сделал import lazy внутри
+    `_entrypoint_main`); добавлен `--profile=test` в `sys.argv`;
+    мок `RuntimePatcher.apply_all` чтобы избежать зависимости от
+    `workspace/tools/*.py`, импортирующих `nanobot.agent.tools.base`.
+  - `tests/test_profile_lifecycle.py::test_streamlit_profile_accepted`
+    — вместо полного `exec_module` streamlit_app.py (который пытается
+    загрузить чат из БД, отсутствующей в CI env) запускается только
+    module-level до первого runtime-вызова
+    (`db_messages = _load_chat_history`).
+
+### Fixed
+
+- **`config.py:load_env`** — `#`-строка без двоеточия (например, русскоязычный
+  комментарий) больше не воспринимается как заголовок секции и не меняет
+  prefix для последующих `KEY=VALUE`. Заголовком считается только строка,
+  содержащая `:` после `#`. Раньше строка вида `# foo: bar` могла перехватить
+  вложенный `LLM_API_KEY=...` под префикс `foo.bar`, из-за чего `${LLM_API_KEY}`
+  в `config.json` оставался нерезолвнутым, и LLM-клиент уходил на провайдера
+  с токеном-литералом (`Authorization: Bearer ${LLM_API_KEY}` → 401).
+- **`audit_analyzer` --mode vector** — `cli.py:470-474` корректно передаёт
+  `--top-k` и `--threshold` в `CacheProvider.search_vector(...)`. Регрессия
+  из-за плоского резолва `${LLM_API_KEY}` устранена: skill возвращает
+  результат из LLM (например, `generated_sql` для «сколько проверок»
+  → 10 строк, `vector` для «плановая проверка» → 3 результата).
+
+### Docs
+
+- **`workspace/skills/audit_analyzer/SKILL.md` § «Два режима выдачи в
+  `--mode vector`»** — добавлено явное описание трёх сценариев
+  (top-K / threshold / комбинация), таблица выбора сценария и CLI-примеры,
+  согласованные с `docs/INTERNAL_API.md`.
+- **`docs/VECTOR_INDEXES.md` § «Два режима выдачи в `search_vector`»** —
+  то же описание продублировано на уровне инфраструктуры (рядом с §
+  «Алгоритм чанкования»), со ссылками на `cache_provider.py:98` и
+  `cache_provider_impl.py::search_vector`.
+- **Дизамбигуация `--threshold` CLI vs `threshold` из конфига индекса**
+  в SKILL.md (раньше формулировка могла ввести в заблуждение).
+
 ## [2.5.2] — 2026-09-14
 
 > **PATCH-релиз v2.5.2:** две группы доработок — (1) **NFS-совместимость**

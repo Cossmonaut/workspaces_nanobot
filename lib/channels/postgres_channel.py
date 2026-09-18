@@ -766,6 +766,140 @@ class PostgresChannel(BaseChannel):
     # Цикл опроса БД
     # ------------------------------------------------------------------
 
+    async def poll_priority_inbound(self, exchange: MessageExchange) -> bool:
+        """Priority polling path: забрать priority-кандидат из БД.
+
+        Семантика:
+          * независим от состояния обычных слотов (``acquire_slot`` /
+            ``chat_inflight``); если все слоты заняты — priority всё равно
+            пройдёт в AgentLoop;
+          * ищет сообщения с ``content`` из списка priority-команд nanobot
+            (``/stop``, ``/restart``, ``/status`` — через
+            ``lib.channels.priority_commands.get_priority_commands()``);
+          * не создаёт assistant-placeholder (команда не ответ);
+          * не блокируется ``_chat_inflight`` (priority должен пройти даже
+            для chat'а, у которого уже активна обычная задача);
+          * после диспатча чистит claim/lease/msg_ctx; **не** делает
+            ``release_slot`` (slot не занимался).
+
+        Вызывается ``MessageExchange._poll_loop`` всегда (до проверки
+        ``is_slot_free()``). Возвращает ``True`` если priority-сообщение
+        обработано, ``False`` если кандидатов нет.
+        """
+        if self._print_worker_activity:
+            await self._report_queue()
+        try:
+            return await self._poll_priority_once(exchange)
+        except Exception as exc:
+            self._journal_event(
+                event_type="channel_poll_error",
+                summary=f"poll_priority_inbound failed: {exc}",
+                payload={
+                    "component": "_poll_priority_once",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    async def _poll_priority_once(self, exchange: MessageExchange) -> bool:
+        """Реализация priority claim + dispatch.
+
+        Шаги:
+          1. ``_claim_one(priority_contents=...)`` — атомарный claim
+             (та же логика, что в ``_poll_once``, плюс фильтр
+             ``content = ANY(%s)`` для всех priority-команд).
+          2. re-check статуса (race-fix из user_stop_signal).
+          3. Если кандидат — priority-команда, диспатчим через
+             ``_handle_message`` с ``metadata["priority"]=True``,
+             ``assistant_msg_id=None``, минуя ``acquire_slot``/
+             ``chat_inflight``.
+          4. Освобождаем claim + lease + msg_ctx.
+        """
+        from lib.channels.priority_commands import get_priority_commands
+        row = await self._claim_one(priority_contents=get_priority_commands())
+        if row is None:
+            return False
+
+        user_msg_id = str(row["id"])
+        self._leases.add(user_msg_id)
+        chat_id = str(row["chat_id"]) if row["chat_id"] else str(row["user_id"])
+        user_id = str(row["user_id"]) if row["user_id"] else chat_id
+        self._lifecycle_log("priority_claimed", user_msg_id, chat_id=chat_id)
+
+        # Race-fix: после claim повторно проверяем статус (между SELECT
+        # подзапроса и UPDATE захвата AW мог пометить cancelled).
+        cur_status = await fetchval(
+            f"SELECT status FROM {self._fq_table} WHERE id = %s",
+            user_msg_id,
+        )
+        if cur_status == "cancelled":
+            self.logger.info(
+                "user_stop_signal: priority skipping cancelled msg {} (chat={})",
+                user_msg_id, chat_id,
+            )
+            await self._delete_claim(None, user_msg_id)
+            self._leases.discard(user_msg_id)
+            self._msg_ctx.pop(user_msg_id, None)
+            return False
+
+        content = row["content"] or ""
+
+        raw_meta = _decode_jsonb(row["metadata"])
+        raw_media = row["media"] or []
+        if isinstance(raw_media, str):
+            raw_media = json.loads(raw_media) if raw_media else []
+        media: list[str] = raw_media if isinstance(raw_media, list) else []
+        session_key = raw_meta.get("session_key") or f"postgres:{chat_id}"
+        media = await self._decode_media_from_db(media, session_key)
+        media_paths, _ = self._resolve_media_paths_and_hints(media)
+        media = media_paths
+
+        # Priority не занимает обычный slot и не блокирует chat для
+        # последующих сообщений. Никакого assistant-placeholder.
+        self._msg_chat[user_msg_id] = chat_id
+        self._activity_print(
+            f"→ [priority] {self._worker_id} взял priority {user_msg_id} "
+            f"(chat {chat_id}): {self._preview(content)}"
+        )
+
+        meta: dict[str, Any] = {
+            "message_id": user_msg_id,
+            "answer_id": None,
+            "priority": True,
+            **raw_meta,
+        }
+
+        try:
+            await self._handle_message(
+                sender_id=user_id,
+                chat_id=chat_id,
+                content=content,
+                media=media,
+                metadata=meta,
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to dispatch priority message {}", user_msg_id,
+            )
+            await self._mark_failed(user_msg_id, None, "dispatch_error")
+            return True
+
+        # Priority не оставляет следа в slot/inflight — но claim и lease
+        # должны быть освобождены. ``_handle_message`` через
+        # ``bus.publish_inbound`` доставит ``/stop`` в AgentLoop.run(),
+        # где ``commands.is_priority(raw)`` инициирует ``cmd_stop`` →
+        # ``_cancel_active_tasks(effective_key)``.
+        await self._delete_claim(None, user_msg_id)
+        self._leases.discard(user_msg_id)
+        self._msg_ctx.pop(user_msg_id, None)
+        self._msg_chat.pop(user_msg_id, None)
+        self._activity_print(
+            f"× [priority] {self._worker_id} обработал priority {user_msg_id} "
+            f"(chat {chat_id})"
+        )
+        return True
+
     async def poll_inbound(self, exchange: MessageExchange) -> bool:
         """Хук транспорта для ``MessageExchange``: берет новое сообщение из БД.
 
@@ -923,7 +1057,11 @@ class PostgresChannel(BaseChannel):
                     },
                 )
 
-    async def _claim_one(self) -> dict | None:
+    async def _claim_one(
+        self,
+        *,
+        priority_contents: tuple[str, ...] | None = None,
+    ) -> dict | None:
         """Атомарно захватить одну задачу и перевести её в ``processing``.
 
         Режимы (выбираются через ``claim_strategy``):
@@ -938,13 +1076,22 @@ class PostgresChannel(BaseChannel):
             инстансов. Задача, захваченная другим воркером, не доступна
             благодаря ``NOT EXISTS (SELECT 1 FROM claims ...)``.
 
+        Если ``priority_contents`` задан (кортеж строк) — claim фильтрует
+        только сообщения с ``content`` из этого списка. Используется для
+        priority polling path (см. ``poll_priority_inbound``).
+
         Возвращает строку-кандидата или None, если задач нет.
         """
         if self._claim_strategy == "single":
-            return await self._claim_one_single()
+            return await self._claim_one_single(priority_contents=priority_contents)
         while True:
             try:
                 async with transaction() as conn:
+                    priority_clause = ""
+                    params: tuple = (self._error_retry_delay,)
+                    if priority_contents is not None:
+                        priority_clause = "  AND content = ANY(%s)\n"
+                        params = (self._error_retry_delay, list(priority_contents))
                     row = await conn.fetchrow(
                         f"""
                         SELECT id, chat_id, user_id, content, media,
@@ -956,7 +1103,8 @@ class PostgresChannel(BaseChannel):
                               OR (status = 'error'
                                   AND updated_at + interval '1 second' * %s < NOW())
                           )
-                          AND NOT EXISTS (
+                          AND status != 'cancelled'
+{priority_clause}                          AND NOT EXISTS (
                               SELECT 1 FROM {self._fq_claims} c
                               WHERE c.task_id = {self._fq_table}.id
                           )
@@ -969,7 +1117,7 @@ class PostgresChannel(BaseChannel):
                         ORDER BY created_at ASC
                         LIMIT 1
                         """,
-                        self._error_retry_delay,
+                        *params,
                     )
                     if row is None:
                         return None
@@ -992,7 +1140,11 @@ class PostgresChannel(BaseChannel):
                 # транзакция откачена, пробуем следующего
                 self.logger.debug("Claim lost (unique violation), retrying")
 
-    async def _claim_one_single(self) -> dict | None:
+    async def _claim_one_single(
+        self,
+        *,
+        priority_contents: tuple[str, ...] | None = None,
+    ) -> dict | None:
         """Single-режим: захват задачи через ``UPDATE ... RETURNING``.
 
         Атомарность обеспечивается подзапросом ``SELECT ... WHERE
@@ -1002,7 +1154,23 @@ class PostgresChannel(BaseChannel):
         Дополнительная защита — фильтр на чат без активной user-задачи.
 
         Не обращается к ``agent_worker_claims``.
+
+        user_stop_signal: ``status != 'cancelled'`` в обоих подзапросах —
+        если AW пометил user-сообщение как ``cancelled`` ДО того, как
+        polling успел его захватить, polling его пропускает (race-free:
+        UPDATE ... WHERE id = (...) сам по себе атомарен, а условие
+        ``status='pending'`` в WHERE подзапроса + ``status != 'cancelled'``
+        гарантирует, что захват не произойдёт).
+
+        Если ``priority_contents`` задан (кортеж строк) — добавляется
+        фильтр ``AND content = ANY(%s)`` в обоих WHERE. Используется для
+        priority polling path (например, ``/stop``, ``/restart``, ``/status``).
         """
+        priority_clause = ""
+        params: tuple = (self._error_retry_delay,)
+        if priority_contents is not None:
+            priority_clause = "  AND content = ANY(%s)\n"
+            params = (self._error_retry_delay, list(priority_contents))
         row = await fetchone(
             f"""
             UPDATE {self._fq_table}
@@ -1015,7 +1183,8 @@ class PostgresChannel(BaseChannel):
                       OR (status = 'error'
                           AND updated_at + interval '1 second' * %s < NOW())
                   )
-                  AND NOT EXISTS (
+                  AND status != 'cancelled'
+{priority_clause}                  AND NOT EXISTS (
                       SELECT 1 FROM {self._fq_table} m2
                       WHERE m2.chat_id = {self._fq_table}.chat_id
                         AND m2.role = 'user'
@@ -1025,9 +1194,10 @@ class PostgresChannel(BaseChannel):
                 LIMIT 1
             )
             AND status = 'pending'
+            AND status != 'cancelled'
             RETURNING id, chat_id, user_id, content, media, metadata, created_at
             """,
-            self._error_retry_delay,
+            *params,
         )
         return row
 
@@ -1036,9 +1206,13 @@ class PostgresChannel(BaseChannel):
 
         Алгоритм:
           1. ``_claim_one`` — атомарный клейм задачи (INSERT claim + processing)
-          2. Проверяем, не занят ли chat_id в этом процессе (chat_inflight)
-          3. Создаём assistant-placeholder (чтобы web-клиент мог опрашивать)
-          4. Захватываем слот (exchange) → _handle_message
+          2. user_stop_signal: re-check статуса — если AW пометил
+             user-сообщение как ``cancelled`` МЕЖДУ ``_claim_one`` и
+             ``_handle_message`` (race window ~миллисекунды, но возможен
+             при сетевой задержке), polling НЕ диспатчит и освобождает claim
+          3. Проверяем, не занят ли chat_id в этом процессе (chat_inflight)
+          4. Создаём assistant-placeholder (чтобы web-клиент мог опрашивать)
+          5. Захватываем слот (exchange) → _handle_message
 
         Если из этого chat_id уже есть активное сообщение в этом процессе,
         возвращаем claim и статус в 'pending' — не диспатчим второе.
@@ -1057,6 +1231,31 @@ class PostgresChannel(BaseChannel):
         user_id = str(row["user_id"]) if row["user_id"] else chat_id
         self._lifecycle_log("claimed", user_msg_id, chat_id=chat_id)
 
+        # user_stop_signal: re-check после claim. Если user-сообщение уже
+        # было помечено как 'cancelled' в момент polling'а — откатываем claim
+        # и пропускаем. Без этого проверка в claim'е (status != 'cancelled'
+        # в WHERE) спасает только от race ДО claim; если AW пишет
+        # 'cancelled' ПОСЛЕ SELECT подзапроса, но ДО UPDATE захвата — наш
+        # SELECT уже прошёл, и мы захватили запись. Эта повторная проверка
+        # закрывает окно race.
+        cur_status = await fetchval(
+            f"SELECT status FROM {self._fq_table} WHERE id = %s",
+            user_msg_id,
+        )
+        if cur_status == "cancelled":
+            self.logger.info(
+                "user_stop_signal: skipping cancelled msg {} (chat={})",
+                user_msg_id, chat_id,
+            )
+            # Освобождаем claim (delete + убираем из _leases); статус уже
+            # 'cancelled' (AW поставил), не трогаем его.
+            await self._delete_claim(None, user_msg_id)
+            self._leases.discard(user_msg_id)
+            self._msg_ctx.pop(user_msg_id, None)
+            return False
+
+        content = row["content"] or ""
+
         # Не диспатчим, если из этого chat_id уже есть активное сообщение
         # в этом же процессе (в БД chat уже считается занятым, но защищаемся
         # от гонки между клеймом и фактическим диспатчем).
@@ -1072,8 +1271,6 @@ class PostgresChannel(BaseChannel):
                 "Deferred msg {} from busy chat {}", user_msg_id, chat_id,
             )
             return False
-
-        content = row["content"] or ""
 
         raw_meta = _decode_jsonb(row["metadata"])
 
@@ -1091,7 +1288,7 @@ class PostgresChannel(BaseChannel):
         media_paths, _ = self._resolve_media_paths_and_hints(media)
         media = media_paths
 
-        # Создаём assistant-placeholder, чтобы Streamlit мог начать опрос
+        # Создаём assistant-placeholder, чтобы Streamlit мог начать опрос.
         try:
             assistant_msg_id = await self._insert_assistant_message(user_msg_id, chat_id)
             self._lifecycle_log(
@@ -1551,6 +1748,50 @@ class PostgresChannel(BaseChannel):
                 "resolver": ctx_meta.get("source"),
             },
         )
+
+        # user_stop_signal: проверяем, не был ли user-запрос отменён ПОКА
+        # LLM работал (от claim до finalize может пройти минута и более
+        # при длинных запросах). Если AW пометил user-сообщение как
+        # 'cancelled' — НЕ пишем ответ, освобождаем ресурсы. Status user'а
+        # НЕ трогаем (он уже 'cancelled' от AW).
+        cur_user_status = await fetchval(
+            f"SELECT status FROM {self._fq_table} WHERE id = %s",
+            user_msg_id,
+        )
+        if cur_user_status == "cancelled":
+            self.logger.info(
+                "user_stop_signal: dropping final response for cancelled user msg "
+                "{} (chat={}, assistant={})",
+                user_msg_id, chat_id, assistant_msg_id,
+            )
+            self._lifecycle_log(
+                "cancelled_drop", user_msg_id, chat_id=chat_id,
+                assistant_msg_id=assistant_msg_id,
+            )
+            # Удаляем assistant-заглушку (если была создана), claim, локальный
+            # контекст. Не трогаем user-строку — её уже пометил AW.
+            try:
+                await execute(
+                    f"DELETE FROM {self._fq_table} WHERE id = %s "
+                    f"AND role = 'assistant'",
+                    assistant_msg_id,
+                )
+            except Exception:
+                self.logger.warning(
+                    "user_stop_signal: failed to delete assistant placeholder {}",
+                    assistant_msg_id,
+                )
+            await self._delete_claim(None, user_msg_id)
+            self._msg_ctx.pop(user_msg_id, None)
+            self._leases.discard(user_msg_id)
+            self._release_slot(user_msg_id)
+            if chat_id:
+                self._drop_context_bridge(chat_id)
+            self._activity_print(
+                f"× [task-worker] {self._worker_id} отменил задачу {user_msg_id} "
+                f"(chat {chat_id}) [cancelled by user]"
+            )
+            return
 
         # Дописываем остатки рассуждений перед финальным ответом.
         # Делаем это ВНЕ финальной транзакции (race с _flush_reasoning
