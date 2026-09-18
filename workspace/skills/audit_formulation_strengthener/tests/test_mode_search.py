@@ -1,201 +1,240 @@
-"""Тесты режима ``search`` — map-reduce по чанкам ВНД."""
+"""Тесты режима ``search``."""
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 
 import pytest
 
+from workspace.skills.audit_formulation_strengthener.scripts.modes import search
+from workspace.skills.audit_formulation_strengthener.scripts.vnd_io import (
+    VndInputError,
+)
 
-_SKILL_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(_SKILL_SCRIPTS))
+
+# -----------------------------------------------------------------------------
+# estimate-only
+# -----------------------------------------------------------------------------
 
 
-def test_search_no_vnd_paths() -> None:
-    """Пустой список ВНД → ошибка ``no_vnd``."""
-    from modes import search
+def test_estimate_only_basic(mock_llm_all, sample_vnd_files) -> None:
+    result, report = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+        estimate_only=True,
+    )
+    assert result["status"] == "success"
+    assert result["data"]["estimate"] is True
+    assert result["data"]["llm_calls_planned"] >= 1
+    assert result["data"]["size_estimate"]["files"] == 1
+    assert report is None
+    assert mock_llm_all.counter.chat_json_calls == 0
 
-    result, report_text = search.run(violation="текст", vnd_paths=[])
+
+def test_empty_vnd_list_returns_no_vnd_error() -> None:
+    result, _ = search.run(violation="X", vnd_paths=[])
     assert result["status"] == "error"
     assert result["data"]["error_type"] == "no_vnd"
-    assert report_text is None
 
 
-def test_search_vnd_not_found(tmp_path: Path) -> None:
-    """Несуществующий путь → ошибка ``vnd_not_found``."""
-    from modes import search
-
+def test_missing_file_returns_vnd_not_found(sample_vnd_files) -> None:
     result, _ = search.run(
-        violation="текст",
-        vnd_paths=[str(tmp_path / "no_such_file.pdf")],
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"]), "/nonexistent/file.pdf"],
     )
     assert result["status"] == "error"
     assert result["data"]["error_type"] == "vnd_not_found"
 
 
-def test_search_estimate_only(
-    mock_prepare_vnd,
+def test_empty_file_returns_vnd_empty_with_filename(mock_llm_all, sample_vnd_files) -> None:
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["empty"])],
+        estimate_only=True,
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "vnd_empty"
+    # D4 fix: имя файла в сообщении.
+    assert "empty.txt" in result["data"]["message"]
+
+
+# -----------------------------------------------------------------------------
+# graceful degradation
+# -----------------------------------------------------------------------------
+
+
+def test_all_chunks_failed_returns_llm_error(
+    mock_llm_all, sample_vnd_files, monkeypatch
 ) -> None:
-    """``--estimate-only`` → нет LLM-вызова."""
-    from modes import search
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        result, report_text = search.run(
-            violation="текст",
-            vnd_paths=["vnd1.txt", "vnd2.txt"],
-            estimate_only=True,
-        )
-
-    assert result["status"] == "success"
-    data = result["data"]
-    assert data["vnd_files"] == 2
-    assert data["vnd_chunks_total"] == 3
-    assert data["map_batches_planned"] == 3
-    assert data["synthesis_llm_calls_planned"] == 1
-    assert report_text is None
-
-
-def test_search_full_pipeline_with_mocks(
-    mock_prepare_vnd, mock_llm_search_map
-) -> None:
-    """Полный map-reduce прогон: 3 чанка, фильтрация, re-rank."""
-    from modes import search
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        m.setattr(search, "call_llm_json", mock_llm_search_map)
-        result, _ = search.run(
-            violation="Срок хранения ПДн — 1 год",
-            vnd_paths=["vnd1.txt", "vnd2.txt"],
-        )
-
-    assert result["status"] == "success"
-    data = result["data"]
-
-    # Всего чанков обработано — 3.
-    assert data["vnd_chunks_total"] == 3
-    assert data["chunks_processed"] == 3
-    assert data["chunks_failed"] == 0
-
-    # Чанк с score=0.05 ("нерелевантный") отфильтрован (< MIN=0.3).
-    findings = data["vnd_findings"]
-    scores = [f["relevance_score"] for f in findings]
-    assert all(s >= 0.3 for s in scores), f"Scores below threshold leaked: {scores}"
-    assert 0.05 not in scores
-
-    # Top-K отсортирован по score убывание.
-    assert scores == sorted(scores, reverse=True), f"Not sorted: {scores}"
-    assert len(findings) <= search.TOP_K_CANDIDATES
-
-    # Первый finding — chunk с score 0.92 (прямое_противоречие).
-    assert findings[0]["relation_type"] == "прямое_противоречие"
-    assert findings[0]["relevance_score"] == 0.92
-
-
-def test_search_resolve_violation_from_analyze(
-    mock_prepare_vnd, mock_llm_search_map
-) -> None:
-    """``analyze_result`` используется как нормализованная формулировка."""
-    from modes import search
-
-    analyze_result = {
-        "status": "success",
-        "data": {"normalized": "НОРМАЛИЗОВАННЫЙ ТЕКСТ"},
-    }
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        m.setattr(search, "call_llm_json", mock_llm_search_map)
-        result, _ = search.run(
-            violation="исходный текст",
-            vnd_paths=["vnd1.txt"],
-            analyze_result=analyze_result,
-        )
-
-    assert result["status"] == "success"
-    assert result["data"]["normalized_violation_used"] == "НОРМАЛИЗОВАННЫЙ ТЕКСТ"
-
-
-def test_search_resolve_violation_from_file(
-    mock_prepare_vnd, mock_llm_search_map, tmp_path: Path
-) -> None:
-    """``analyze_result_path`` загружается из файла."""
-    from modes import search
-
-    analyze_file = tmp_path / "analyze.json"
-    analyze_file.write_text(
-        '{"status": "success", "data": {"normalized": "ИЗ ФАЙЛА"}}',
-        encoding="utf-8",
+    """Все чанки провалились на JSON-парсинге → llm_error (D7)."""
+    from workspace.skills.audit_formulation_strengthener.scripts.llm import (
+        JsonParseError,
     )
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        m.setattr(search, "call_llm_json", mock_llm_search_map)
-        result, _ = search.run(
-            violation="исходный",
-            vnd_paths=["vnd1.txt"],
-            analyze_result_path=str(analyze_file),
-        )
+    def always_fail_json(**kwargs):
+        raise JsonParseError("simulated", raw_text="bad", attempt=2)
 
-    assert result["status"] == "success"
-    assert result["data"]["normalized_violation_used"] == "ИЗ ФАЙЛА"
+    search_mod = __import__(
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.search",
+        fromlist=["chat_json"],
+    )
+    monkeypatch.setattr(search_mod, "chat_json", always_fail_json)
+
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "llm_error"
 
 
-def test_search_one_chunk_failure_does_not_crash(
-    mock_prepare_vnd,
+def test_partial_failure_yields_success_with_chunks_failed(
+    mock_llm_all, sample_vnd_files, monkeypatch
 ) -> None:
-    """Если LLM падает на одном чанке — остальные продолжают обрабатываться."""
-    from modes import search
-    from llm_client import JsonParseError
+    """1 из 2 чанков упал → success, chunks_failed=1, остальные findings есть."""
+    search_mod = __import__(
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.search",
+        fromlist=["chat_json"],
+    )
 
-    def selective_failure(system, user, operation):
-        # Падаем на втором чанке (первый в списке — chunk_index=0).
-        if "Раздел 6.1" in system:
-            raise JsonParseError("bad json")
+    counter = {"n": 0}
+
+    def partial_chat_json(**kwargs):
+        counter["n"] += 1
+        if counter["n"] == 1:
+            from workspace.skills.audit_formulation_strengthener.scripts.llm import (
+                JsonParseError,
+            )
+
+            raise JsonParseError("simulated", raw_text="bad", attempt=2)
         return {
             "relation_type": "контекст",
-            "relevance_score": 0.5,
+            "relevance_score": 0.8,
             "why_matches": "ok",
         }
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        m.setattr(search, "call_llm_json", selective_failure)
-        result, _ = search.run(
-            violation="текст",
-            vnd_paths=["vnd1.txt"],
-        )
+    monkeypatch.setattr(search_mod, "chat_json", partial_chat_json)
 
+    # Берём 2 файла, чтобы было > 1 чанк (split_text разобьёт первый по абзацам).
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[
+            str(sample_vnd_files["file1"]),
+            str(sample_vnd_files["file2"]),
+        ],
+    )
     assert result["status"] == "success"
-    data = result["data"]
-    assert data["chunks_failed"] >= 1
-    assert data["chunks_processed"] == 3
-    # Должно быть как минимум 1 success finding.
-    assert len(data["vnd_findings"]) >= 1
+    assert result["data"]["chunks_failed"] >= 1
+    assert len(result["data"]["vnd_findings"]) >= 1
 
 
-def test_search_invalid_relation_type_normalized(
-    mock_prepare_vnd,
+# -----------------------------------------------------------------------------
+# фильтрация / top-K / evidence_id
+# -----------------------------------------------------------------------------
+
+
+def test_evidence_id_assigned_sequentially(mock_llm_all, sample_vnd_files) -> None:
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[
+            str(sample_vnd_files["file1"]),
+            str(sample_vnd_files["file2"]),
+        ],
+    )
+    assert result["status"] == "success"
+    findings = result["data"]["vnd_findings"]
+    eids = [f["evidence_id"] for f in findings]
+    assert eids[0] == "F1"
+    assert eids == [f"F{i+1}" for i in range(len(eids))]
+
+
+def test_relation_type_outside_whitelist_coerced_to_context(
+    mock_llm_all, sample_vnd_files
 ) -> None:
-    """Невалидный relation_type → ``контекст``."""
-    from modes import search
+    mock_llm_all.set_response(
+        "search_map",
+        {
+            "relation_type": "неизвестный_тип",  # не в whitelist
+            "relevance_score": 0.7,
+            "why_matches": "x",
+        },
+    )
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+    )
+    for f in result["data"]["vnd_findings"]:
+        assert f["relation_type"] == "контекст"
 
-    def bad_relation(system, user, operation):
-        return {
-            "relation_type": "что-то непонятное",
-            "relevance_score": 0.4,
-            "why_matches": "...",
-        }
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(search, "prepare_vnd", mock_prepare_vnd)
-        m.setattr(search, "call_llm_json", bad_relation)
-        result, _ = search.run(
-            violation="текст",
-            vnd_paths=["vnd1.txt"],
-        )
+def test_score_below_threshold_excluded(mock_llm_all, sample_vnd_files) -> None:
+    mock_llm_all.set_response(
+        "search_map",
+        {
+            "relation_type": "контекст",
+            "relevance_score": 0.1,  # < MIN_RELEVANCE_SCORE=0.3
+            "why_matches": "x",
+        },
+    )
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+    )
+    assert result["data"]["vnd_findings"] == []
 
+
+# -----------------------------------------------------------------------------
+# too_many_chunks
+# -----------------------------------------------------------------------------
+
+
+def test_too_many_chunks_returns_error(
+    mock_llm_all, sample_vnd_files, monkeypatch
+) -> None:
+    # Подменяем get_tool_config чтобы вернуть max_chunks=0.
+    from workspace.skills.audit_formulation_strengthener.scripts import vnd_io
+
+    def fake_get_tool_config(skill_name):
+        return {"execution": {"max_chunks_for_execution": 0}}
+
+    monkeypatch.setattr(vnd_io, "get_tool_config", fake_get_tool_config)
+
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+        estimate_only=True,
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "too_many_chunks"
+
+
+# -----------------------------------------------------------------------------
+# analyze_result_unreadable
+# -----------------------------------------------------------------------------
+
+
+def test_analyze_result_path_unreadable(sample_vnd_files) -> None:
+    result, _ = search.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+        analyze_result_path="/nonexistent/analyze.json",
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "analyze_result_unreadable"
+
+
+# -----------------------------------------------------------------------------
+# Фолбэк на сырой violation
+# -----------------------------------------------------------------------------
+
+
+def test_no_analyze_result_falls_back_to_raw_violation(
+    mock_llm_all, sample_vnd_files
+) -> None:
+    result, _ = search.run(
+        violation="Срок хранения ПДн 1 год",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+    )
     assert result["status"] == "success"
-    assert result["data"]["vnd_findings"][0]["relation_type"] == "контекст"
+    assert result["data"]["normalized_violation_used"] == "Срок хранения ПДн 1 год"

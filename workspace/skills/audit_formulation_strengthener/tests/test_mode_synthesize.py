@@ -1,230 +1,346 @@
-"""Тесты режима ``synthesize`` — финальный отчёт."""
+"""Тесты режима ``synthesize`` (валидация цитат, рендеры)."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
+from workspace.skills.audit_formulation_strengthener.scripts.modes import synthesize
+from workspace.skills.audit_formulation_strengthener.scripts.report import (
+    docx_render,
+    markdown,
+    plain,
+)
+from workspace.skills.audit_formulation_strengthener.scripts.llm import JsonParseError
 
-_SKILL_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(_SKILL_SCRIPTS))
+from .conftest import make_analyze_result, make_search_result
 
 
-def test_synthesize_estimate_only() -> None:
-    """``--estimate-only`` без LLM."""
-    from modes import synthesize
+# -----------------------------------------------------------------------------
+# estimate-only
+# -----------------------------------------------------------------------------
 
-    result, report_text = synthesize.run(
-        violation="текст",
-        search_result={
-            "status": "success",
-            "data": {"vnd_findings": [{"x": 1}, {"x": 2}]},
-        },
+
+def test_estimate_only_requires_vnd(mock_llm_all) -> None:
+    result, _ = synthesize.run(
+        violation="X",
+        vnd_paths=None,
+        estimate_only=True,
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "no_vnd"
+
+
+def test_estimate_only_with_vnd_does_io_no_llm(
+    mock_llm_all, sample_vnd_files
+) -> None:
+    result, report = synthesize.run(
+        violation="Срок хранения ПДн установлен 1 год",
+        vnd_paths=[str(sample_vnd_files["file1"])],
         estimate_only=True,
     )
     assert result["status"] == "success"
-    assert result["data"]["vnd_findings_available"] == 2
-    assert report_text is None
+    assert result["data"]["estimate"] is True
+    assert result["data"]["llm_calls_planned"] >= 3  # 1 + N + 1
+    assert "size_estimate" in result["data"]
+    assert report is None
+    assert mock_llm_all.counter.chat_json_calls == 0
 
 
-def test_synthesize_full_with_mocks(mock_llm_synthesize) -> None:
-    """Полный синтез: analyze + search → markdown-отчёт."""
-    from modes import synthesize
+# -----------------------------------------------------------------------------
+# Валидация цитат
+# -----------------------------------------------------------------------------
 
-    analyze_result = {
-        "status": "success",
-        "data": {
-            "normalized": "В организации установлен срок хранения ПДн — 1 год.",
-            "severity": "высокая",
-            "key_concepts": ["срок хранения", "ПДн"],
-        },
-    }
-    search_result = {
-        "status": "success",
-        "data": {
-            "vnd_findings": [
+
+def test_valid_substring_passes_through(mock_llm_all) -> None:
+    analyze_res = make_analyze_result(normalized="Нормализованная формулировка")
+    search_res = make_search_result(
+        findings=[
+            {
+                "evidence_id": "F1",
+                "source_file": "vnd1.txt",
+                "chunk_index": 0,
+                "text_excerpt": "Срок хранения ПДн — 1 год с момента сбора данных.",
+                "relation_type": "прямое_противоречие",
+                "relevance_score": 0.85,
+                "why_matches": "прямое нарушение",
+            },
+        ]
+    )
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "Анализ отклонения",
+            "violation_summary": ["Срок хранения ПДн"],
+            "established_facts": ["Факт"],
+            "deviation_analysis": ["Анализ"],
+            "vnd_citations": [
                 {
-                    "source_file": "vnd1.txt",
-                    "section_title": "5.4",
-                    "section_path": "5 / 5.4",
-                    "text_excerpt": "Срок хранения ПДн — не менее 5 лет.",
-                    "relation_type": "прямое_противоречие",
-                    "relevance_score": 0.9,
-                    "why_matches": "Прямое противоречие.",
-                }
-            ]
+                    "evidence_id": "F1",
+                    "excerpt": "Срок хранения ПДн — 1 год",  # точная подстрока
+                    "relation_explanation": "прямое нарушение нормы",
+                },
+            ],
+            "verdict": {"category": "высокая", "verdict_text": ["вердикт"]},
+            "recommended_formulation": ["рекомендация"],
         },
-    }
+    )
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, report_text = synthesize.run(
-            violation="исходный",
-            analyze_result=analyze_result,
-            search_result=search_result,
-        )
-
+    result, _ = synthesize.run(
+        violation="X",
+        analyze_result=analyze_res,
+        search_result=search_res,
+    )
     assert result["status"] == "success"
-    data = result["data"]
-    assert data["title"].startswith("Анализ отклонения")
-    assert data["severity"] == "высокая"
-    assert "date_iso" in data
-    assert isinstance(data["vnd_citations"], list)
-    assert len(data["vnd_citations"]) >= 1
-    assert isinstance(data["recommended_formulation"], list)
+    assert len(result["data"]["vnd_citations"]) == 1
+    assert result["data"]["vnd_citations"][0]["evidence_id"] == "F1"
+    assert (
+        result["data"]["vnd_citations"][0]["relation_type"] == "прямое_противоречие"
+    )  # из находки, не из LLM
+    assert result["data"]["citations_dropped"] == 0
 
-    # Markdown-отчёт не пуст и содержит ключевые секции.
-    assert report_text is not None
-    md = report_text
-    assert "# Анализ отклонения" in md
-    assert "## 1. Краткое изложение" in md
+
+def test_fabricated_excerpt_dropped(mock_llm_all) -> None:
+    analyze_res = make_analyze_result()
+    search_res = make_search_result(
+        findings=[
+            {
+                "evidence_id": "F1",
+                "source_file": "vnd1.txt",
+                "chunk_index": 0,
+                "text_excerpt": "Точный текст из ВНД.",
+                "relation_type": "контекст",
+                "relevance_score": 0.7,
+                "why_matches": "x",
+            },
+        ]
+    )
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "Анализ",
+            "violation_summary": ["x"],
+            "established_facts": ["x"],
+            "deviation_analysis": ["x"],
+            "vnd_citations": [
+                {
+                    "evidence_id": "F1",
+                    "excerpt": "Точный текст ИЗ ВНД.",  # изменено
+                    "relation_explanation": "x",
+                },
+            ],
+            "verdict": {"category": "средняя", "verdict_text": ["x"]},
+            "recommended_formulation": ["x"],
+        },
+    )
+
+    result, _ = synthesize.run(
+        violation="X",
+        analyze_result=analyze_res,
+        search_result=search_res,
+    )
+    assert result["status"] == "success"
+    assert result["data"]["vnd_citations"] == []
+    assert result["data"]["citations_dropped"] == 1
+
+
+def test_unknown_evidence_id_dropped(mock_llm_all) -> None:
+    analyze_res = make_analyze_result()
+    search_res = make_search_result(findings=[])
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "x",
+            "violation_summary": ["x"],
+            "established_facts": ["x"],
+            "deviation_analysis": ["x"],
+            "vnd_citations": [
+                {"evidence_id": "F99", "excerpt": "x", "relation_explanation": "x"},
+            ],
+            "verdict": {"category": "средняя", "verdict_text": ["x"]},
+            "recommended_formulation": ["x"],
+        },
+    )
+
+    result, _ = synthesize.run(
+        violation="X",
+        analyze_result=analyze_res,
+        search_result=search_res,
+    )
+    assert result["data"]["citations_dropped"] == 1
+    assert result["data"]["vnd_citations"] == []
+
+
+def test_all_citations_dropped_is_still_success(mock_llm_all) -> None:
+    analyze_res = make_analyze_result()
+    search_res = make_search_result(findings=[])
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "x",
+            "violation_summary": ["x"],
+            "established_facts": [],
+            "deviation_analysis": [],
+            "vnd_citations": [
+                {"evidence_id": "F1", "excerpt": "x", "relation_explanation": "x"},
+            ],
+            "verdict": {"category": "средняя", "verdict_text": ["x"]},
+            "recommended_formulation": ["x"],
+        },
+    )
+
+    result, _ = synthesize.run(
+        violation="X",
+        analyze_result=analyze_res,
+        search_result=search_res,
+    )
+    assert result["status"] == "success"
+    assert result["data"]["citations_dropped"] == 1
+    assert "warning" not in result["data"]  # не меняем status
+
+
+# -----------------------------------------------------------------------------
+# Resume из файлов
+# -----------------------------------------------------------------------------
+
+
+def test_unreadable_analyze_result_file(
+    mock_llm_all, sample_vnd_files
+) -> None:
+    result, _ = synthesize.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+        analyze_result_path="/nonexistent/analyze.json",
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "analyze_result_unreadable"
+
+
+def test_unreadable_search_result_file(mock_llm_all, sample_vnd_files) -> None:
+    result, _ = synthesize.run(
+        violation="X",
+        vnd_paths=[str(sample_vnd_files["file1"])],
+        search_result_path="/nonexistent/search.json",
+    )
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "search_result_unreadable"
+
+
+# -----------------------------------------------------------------------------
+# Рендеры
+# -----------------------------------------------------------------------------
+
+
+def test_markdown_renders_6_sections() -> None:
+    data = {
+        "title": "Тест",
+        "violation_summary": ["summary"],
+        "established_facts": ["fact"],
+        "deviation_analysis": ["analysis"],
+        "vnd_citations": [
+            {
+                "evidence_id": "F1",
+                "source_file": "vnd.txt",
+                "chunk_index": 0,
+                "excerpt": "Цитата из ВНД",
+                "relation_type": "контекст",
+                "relation_explanation": "объяснение",
+            },
+        ],
+        "citations_dropped": 0,
+        "verdict": {"category": "средняя", "verdict_text": ["вердикт"]},
+        "recommended_formulation": ["рекомендация"],
+        "normalized_violation": "нормал.",
+        "severity": "средняя",
+        "source_findings_count": 1,
+        "date_iso": "2026-09-18T00:00:00+00:00",
+    }
+    md = markdown.render_markdown(data)
+    assert "## 1. Краткое изложение отклонения" in md
+    assert "## 2. Установленные факты (по ВНД)" in md
+    assert "## 3. Анализ отклонения" in md
+    assert "## 4. Релевантные фрагменты ВНД (валидированные цитаты)" in md
     assert "## 5. Итоговая классификация" in md
     assert "## 6. Рекомендуемая усиленная формулировка" in md
+    # Цитата в blockquote.
+    assert "> Цитата из ВНД" in md
+    # Метаданные.
+    assert "F1" in md
+    assert "vnd.txt" in md
 
 
-def test_synthesize_no_vnd_findings(mock_llm_synthesize) -> None:
-    """Если нет ВНД-findings — синтез всё равно работает."""
-    from modes import synthesize
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, report_text = synthesize.run(
-            violation="что-то",
-            search_result={"status": "success", "data": {"vnd_findings": []}},
-        )
-
-    assert result["status"] == "success"
-    # В citations — что-то (LLM может вернуть пустой массив или дефолты).
-    assert isinstance(result["data"]["vnd_citations"], list)
-    assert report_text is not None
-
-
-def test_synthesize_severity_fallback_when_no_analyze(mock_llm_synthesize) -> None:
-    """Если analyze не передан — severity = 'средняя'."""
-    from modes import synthesize
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, _ = synthesize.run(violation="что-то")
-
-    assert result["status"] == "success"
-    assert result["data"]["severity"] == "средняя"
+def test_markdown_renders_empty_sections_with_placeholder() -> None:
+    data = {
+        "title": "x",
+        "violation_summary": [],
+        "established_facts": [],
+        "deviation_analysis": [],
+        "vnd_citations": [],
+        "citations_dropped": 0,
+        "verdict": {"category": "средняя", "verdict_text": []},
+        "recommended_formulation": [],
+        "normalized_violation": "",
+        "severity": "средняя",
+        "source_findings_count": 0,
+        "date_iso": "",
+    }
+    md = markdown.render_markdown(data)
+    # Все 6 секций с пустым содержимым получают плейсхолдер.
+    assert md.count("*(секция не заполнена:") == 6  # 1, 2, 3, 4, 5, 6
 
 
-def test_synthesize_save_to_md(mock_llm_synthesize, tmp_path: Path) -> None:
-    """Сохранение в .md-файл."""
-    from modes import synthesize
-
-    target = tmp_path / "report.md"
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, report_text = synthesize.run(
-            violation="что-то",
-            output_format="md",
-            output_path=str(target),
-        )
-
-    assert result["status"] == "success"
-    assert result.get("saved_to") == str(target)
-    assert target.exists()
-    content = target.read_text(encoding="utf-8")
-    assert content == report_text
-    assert "# Анализ отклонения" in content
-
-
-def test_synthesize_save_to_txt(mock_llm_synthesize, tmp_path: Path) -> None:
-    """Сохранение в .txt (с простым strip-markdown)."""
-    from modes import synthesize
-
-    target = tmp_path / "report.txt"
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, _ = synthesize.run(
-            violation="что-то",
-            output_format="txt",
-            output_path=str(target),
-        )
-
-    assert result["status"] == "success"
-    assert target.exists()
-    content = target.read_text(encoding="utf-8")
-    # Нет markdown-заголовков.
-    assert "##" not in content
-    assert "**" not in content
-    # Но есть текст.
-    assert "Анализ отклонения" in content
+def test_plain_strips_markdown() -> None:
+    data = {
+        "title": "Тест",
+        "violation_summary": ["summary"],
+        "established_facts": ["fact"],
+        "deviation_analysis": ["analysis"],
+        "vnd_citations": [],
+        "citations_dropped": 0,
+        "verdict": {"category": "средняя", "verdict_text": ["вердикт"]},
+        "recommended_formulation": ["рекомендация"],
+        "normalized_violation": "",
+        "severity": "средняя",
+        "source_findings_count": 0,
+        "date_iso": "",
+    }
+    out = plain.render_plain(data)
+    assert "##" not in out
+    assert "**" not in out
+    assert "summary" in out
 
 
-def test_synthesize_save_to_docx(mock_llm_synthesize, tmp_path: Path) -> None:
-    """Сохранение в .docx через python-docx."""
-    from modes import synthesize
-
-    target = tmp_path / "report.docx"
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, _ = synthesize.run(
-            violation="что-то",
-            output_format="docx",
-            output_path=str(target),
-        )
-
-    assert result["status"] == "success"
-    assert target.exists()
-    assert target.stat().st_size > 1000  # не пустой
-
-
-def test_synthesize_load_from_file(
-    mock_llm_synthesize, tmp_path: Path
-) -> None:
-    """Загрузка analyze/search из файлов."""
-    from modes import synthesize
-
-    a_file = tmp_path / "a.json"
-    a_file.write_text(
-        '{"data": {"normalized": "FROM FILE", "severity": "низкая"}}',
-        encoding="utf-8",
+def test_docx_import_error_message() -> None:
+    """Если python-docx недоступен — RuntimeError с понятным сообщением."""
+    from workspace.skills.audit_formulation_strengthener.scripts.report import (
+        docx_render as docx_mod,
     )
-    s_file = tmp_path / "s.json"
-    s_file.write_text('{"data": {"vnd_findings": []}}', encoding="utf-8")
+    import builtins
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", mock_llm_synthesize)
-        result, _ = synthesize.run(
-            violation="orig",
-            analyze_result_path=str(a_file),
-            search_result_path=str(s_file),
-        )
+    real_import = builtins.__import__
 
-    assert result["status"] == "success"
-    assert result["data"]["normalized_violation"] == "FROM FILE"
-    assert result["data"]["severity"] == "низкая"
+    def fake_import(name, *args, **kwargs):
+        if name == "docx":
+            raise ImportError("simulated: python-docx не установлен")
+        return real_import(name, *args, **kwargs)
 
+    data = {
+        "title": "x",
+        "violation_summary": [],
+        "established_facts": [],
+        "deviation_analysis": [],
+        "vnd_citations": [],
+        "citations_dropped": 0,
+        "verdict": {"category": "средняя", "verdict_text": []},
+        "recommended_formulation": [],
+        "normalized_violation": "",
+        "severity": "средняя",
+        "source_findings_count": 0,
+        "date_iso": "",
+    }
 
-def test_synthesize_invalid_citation_relation_normalized(mock_llm_synthesize) -> None:
-    """Невалидный relation_type в citations → ``контекст``."""
-    from modes import synthesize
-
-    def bad_citations(system, user, operation):
-        d = dict(mock_llm_synthesize(system, user, operation))
-        d["vnd_citations"] = [
-            {
-                "source_file": "x",
-                "section_title": "y",
-                "excerpt": "...",
-                "relation_type": "непонятно_что",
-                "relation_explanation": "...",
-            }
-        ]
-        return d
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(synthesize, "call_llm_json", bad_citations)
-        result, _ = synthesize.run(violation="что-то")
-
-    assert result["status"] == "success"
-    assert result["data"]["vnd_citations"][0]["relation_type"] == "контекст"
+    builtins.__import__ = fake_import
+    try:
+        with pytest.raises(RuntimeError, match="python-docx"):
+            docx_mod.write_docx(data, "/tmp/nope.docx")
+    finally:
+        builtins.__import__ = real_import

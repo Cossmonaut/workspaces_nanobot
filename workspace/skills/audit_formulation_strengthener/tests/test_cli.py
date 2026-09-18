@@ -1,8 +1,4 @@
-"""Тесты CLI-обёртки ``scripts/cli.py``.
-
-Тестируем через прямой вызов ``main(argv)`` — это позволяет
-использовать моки для LLM и не дёргать subprocess.
-"""
+"""Тесты CLI: end-to-end через ``main(argv)``."""
 
 from __future__ import annotations
 
@@ -10,259 +6,257 @@ import io
 import json
 import sys
 from contextlib import redirect_stdout
-from pathlib import Path
-from typing import Any
 
 import pytest
 
-
-# _SKILL_SCRIPTS вычисляется в _run_cli, чтобы conftest.py успел
-# настроить sys.path.
-def _get_skill_scripts() -> Path:
-    return Path(__file__).resolve().parents[1] / "scripts"
+from workspace.skills.audit_formulation_strengthener.scripts import cli
+from workspace.skills.audit_formulation_strengthener.scripts.report import markdown
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _run(argv: list[str]) -> tuple[int, str, str]:
+    """Запустить ``cli.main(argv)`` с перехватом stdout/stderr.
 
-
-def _run_cli(
-    *argv: str,
-    monkeypatch: pytest.MonkeyPatch,
-    llm_mock: Any,
-    prepare_vnd_mock: Any | None = None,
-) -> tuple[int, str]:
-    """Запустить CLI с моками, вернуть (returncode, stdout)."""
-    import importlib.util
-
-    _SKILL_SCRIPTS = _get_skill_scripts()
-    spec = importlib.util.spec_from_file_location(
-        "afs_cli", _SKILL_SCRIPTS / "cli.py"
-    )
-    cli_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_mod)  # type: ignore[union-attr]
-
-    # Принудительно импортируем modes, чтобы они появились в sys.modules.
-    # Иначе патч не сработает, т.к. modes импортируется через
-    # 'from modes import analyze' внутри функций cli.py.
-    for mode_name in ("analyze", "search", "synthesize"):
-        mod_key = f"modes.{mode_name}"
-        if mod_key not in sys.modules:
-            import importlib
-            importlib.import_module(mod_key)
-
-    # Подменяем LLM через sys.modules.
-    for mode_name in ("analyze", "search", "synthesize"):
-        mod_key = f"modes.{mode_name}"
-        if mod_key in sys.modules:
-            monkeypatch.setattr(sys.modules[mod_key], "call_llm_json", llm_mock)
-
-    # Подменяем prepare_vnd в vnd_io.
-    if prepare_vnd_mock is not None:
-        if "vnd_io" not in sys.modules:
-            import importlib
-            importlib.import_module("vnd_io")
-        monkeypatch.setattr(sys.modules["vnd_io"], "prepare_vnd", prepare_vnd_mock)
-
-    # Перехватываем stdout.
-    buf = io.StringIO()
-    with redirect_stdout(buf):
+    Returns:
+        ``(exit_code, stdout, stderr)``.
+    """
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with redirect_stdout(out_buf):
+        old_stderr = sys.stderr
+        sys.stderr = err_buf
         try:
-            rc = cli_mod.main(list(argv))
-        except SystemExit as exc:
-            rc = exc.code if isinstance(exc.code, int) else 1
-    return rc, buf.getvalue()
+            exit_code = cli.main(argv)
+        finally:
+            sys.stderr = old_stderr
+    return exit_code, out_buf.getvalue(), err_buf.getvalue()
 
 
-def _all_mock(system, user, operation):
-    """Единый мок для всех трёх операций."""
-    if operation == "analyze":
-        return {
-            "normalized": "В организации установлен срок хранения ПДн — 1 год.",
-            "key_concepts": ["срок хранения", "ПДн"],
-            "severity": "высокая",
-            "suggested_vnd_sections": ["Сроки хранения ПДн"],
-        }
-    if operation == "search_map":
-        return {
-            "relation_type": "прямое_противоречие",
-            "relevance_score": 0.9,
-            "why_matches": "Прямое противоречие.",
-        }
-    if operation == "synthesize":
-        return {
-            "title": "Анализ отклонения",
-            "violation_summary": ["Нормализованный текст."],
-            "established_facts": ["Установлено."],
-            "deviation_analysis": ["Анализ."],
+# -----------------------------------------------------------------------------
+# estimate-only
+# -----------------------------------------------------------------------------
+
+
+def test_cli_all_estimate_only_zero_calls(
+    mock_llm_all, sample_vnd_files
+) -> None:
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "all",
+            "--estimate-only",
+            "--violation", "Срок хранения ПДн 1 год",
+            "--vnd", str(sample_vnd_files["file1"]),
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(stdout)
+    assert payload["status"] == "success"
+    assert payload["data"]["estimate"] is True
+    assert payload["data"]["llm_calls_planned"] >= 3
+    assert mock_llm_all.counter.chat_json_calls == 0
+
+
+def test_cli_analyze_estimate_only_without_vnd(mock_llm_all) -> None:
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "analyze",
+            "--estimate-only",
+            "--violation", "Test",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(stdout)
+    assert payload["data"]["estimate"] is True
+    assert payload["data"]["vnd_count"] == 0
+    assert payload["data"]["llm_calls_planned"] == 1
+
+
+def test_cli_search_estimate_only(mock_llm_all, sample_vnd_files) -> None:
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "search",
+            "--estimate-only",
+            "--violation", "x",
+            "--vnd", str(sample_vnd_files["file1"]),
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(stdout)
+    assert payload["data"]["llm_calls_planned"] >= 1
+
+
+# -----------------------------------------------------------------------------
+# Exit-коды
+# -----------------------------------------------------------------------------
+
+
+def test_cli_no_vnd_exits_2_with_no_vnd_json(mock_llm_all) -> None:
+    exit_code, stdout, _ = _run(
+        ["--mode", "all", "--violation", "x"]
+    )
+    assert exit_code == 2
+    payload = json.loads(stdout)
+    assert payload["data"]["error_type"] == "no_vnd"
+
+
+def test_cli_empty_violation_exits_2(mock_llm_all, sample_vnd_files) -> None:
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "analyze",
+            "--violation", "   ",
+        ]
+    )
+    assert exit_code == 2
+    payload = json.loads(stdout)
+    assert payload["data"]["error_type"] == "empty_violation"
+
+
+def test_cli_missing_file_exits_2(mock_llm_all) -> None:
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "search",
+            "--violation", "x",
+            "--vnd", "/nonexistent/file.pdf",
+        ]
+    )
+    assert exit_code == 2
+    payload = json.loads(stdout)
+    assert payload["data"]["error_type"] == "vnd_not_found"
+
+
+# -----------------------------------------------------------------------------
+# estimate-only + --output → --output игнорируется (П6)
+# -----------------------------------------------------------------------------
+
+
+def test_cli_estimate_only_ignores_output(
+    mock_llm_all, sample_vnd_files, tmp_path
+) -> None:
+    target = tmp_path / "should_not_exist.json"
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "all",
+            "--estimate-only",
+            "--violation", "x",
+            "--vnd", str(sample_vnd_files["file1"]),
+            "--output", str(target),
+        ]
+    )
+    assert exit_code == 0
+    # Файл НЕ должен быть создан.
+    assert not target.exists()
+    # JSON ушёл в stdout.
+    payload = json.loads(stdout)
+    assert payload["data"]["estimate"] is True
+
+
+# -----------------------------------------------------------------------------
+# --output → файл + brief JSON в stdout (D10)
+# ---------------------------------------------------------------------`--------
+
+
+def test_cli_synthesize_with_output_creates_file_and_brief(
+    mock_llm_all, sample_vnd_files, tmp_path
+) -> None:
+    target = tmp_path / "report.md"
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "Тестовый отчёт",
+            "violation_summary": ["s"],
+            "established_facts": ["f"],
+            "deviation_analysis": ["a"],
             "vnd_citations": [],
-            "verdict": {"category": "высокая", "verdict_text": ["Итог."]},
-            "recommended_formulation": ["Рекомендация."],
-        }
-    raise RuntimeError(f"unexpected op: {operation}")
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_cli_analyze_mode(
-    monkeypatch: pytest.MonkeyPatch, mock_prepare_vnd: Any
-) -> None:
-    """``--mode analyze`` → JSON-вывод с data.normalized."""
-    # Подготовить моки: search_map НЕ должен вызываться.
-    called = {"analyze": 0, "search": 0, "synth": 0}
-
-    def counting(system, user, operation):
-        if operation == "analyze":
-            called["analyze"] += 1
-        elif operation == "search_map":
-            called["search"] += 1
-        elif operation == "synthesize":
-            called["synth"] += 1
-        return _all_mock(system, user, operation)
-
-    rc, out = _run_cli(
-        "--mode", "analyze",
-        "--violation", "Срок хранения ПДн — 1 год",
-        "--vnd", "vnd1.txt",
-        monkeypatch=monkeypatch,
-        llm_mock=counting,
-        prepare_vnd_mock=mock_prepare_vnd,
+            "verdict": {"category": "средняя", "verdict_text": ["v"]},
+            "recommended_formulation": ["r"],
+        },
     )
 
-    assert rc == 0
-    parsed = json.loads(out)
-    assert parsed["status"] == "success"
-    assert parsed["data"]["normalized"].startswith("В организации")
-    assert called["analyze"] == 1
-    assert called["search"] == 0
-    assert called["synth"] == 0
-
-
-def test_cli_estimate_only(
-    monkeypatch: pytest.MonkeyPatch, mock_prepare_vnd: Any
-) -> None:
-    """``--estimate-only`` → без LLM-вызовов."""
-    called = {"any": 0}
-
-    def counting(system, user, operation):
-        called["any"] += 1
-        return _all_mock(system, user, operation)
-
-    rc, out = _run_cli(
-        "--mode", "all",
-        "--violation", "...",
-        "--vnd", "vnd1.txt",
-        "--estimate-only",
-        monkeypatch=monkeypatch,
-        llm_mock=counting,
-        prepare_vnd_mock=mock_prepare_vnd,
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "synthesize",
+            "--violation", "x",
+            "--vnd", str(sample_vnd_files["file1"]),
+            "--output", str(target),
+        ]
     )
+    assert exit_code == 0
+    assert target.exists()
+    content = target.read_text(encoding="utf-8")
+    assert "Тестовый отчёт" in content
+    assert "## 1. Краткое изложение отклонения" in content
+    # В stdout — краткий JSON (D10 fix).
+    brief = json.loads(stdout.strip())
+    assert brief["mode"] == "synthesize"
+    assert brief["status"] == "success"
+    assert brief["saved_to"].endswith("report.md")
 
-    assert rc == 0
-    assert called["any"] == 0  # нет LLM-вызовов при --estimate-only
-    parsed = json.loads(out)
-    assert parsed["status"] == "success"
-    assert "llm_calls_planned" in parsed["data"] or "vnd_chunks_total" in parsed["data"]
+
+# -----------------------------------------------------------------------------
+# --internal-format json
+# -----------------------------------------------------------------------------
 
 
-def test_cli_no_vnd(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_cli_synthesize_internal_format_json(
+    mock_llm_all, sample_vnd_files
 ) -> None:
-    """Без ``--vnd`` → ошибка exit-code 2."""
-    called: list[str] = []
-
-    def counting(system, user, operation):
-        called.append(operation)
-        return _all_mock(system, user, operation)
-
-    rc, out = _run_cli(
-        "--mode", "analyze",
-        "--violation", "что-то",
-        monkeypatch=monkeypatch,
-        llm_mock=counting,
+    mock_llm_all.set_response(
+        "synthesize",
+        {
+            "title": "Test",
+            "violation_summary": ["s"],
+            "established_facts": ["f"],
+            "deviation_analysis": ["a"],
+            "vnd_citations": [],
+            "verdict": {"category": "средняя", "verdict_text": ["v"]},
+            "recommended_formulation": ["r"],
+        },
     )
-
-    assert rc == 2
-    parsed = json.loads(out)
-    assert parsed["status"] == "error"
-    assert called == []  # LLM не вызывался
-
-
-def test_cli_empty_violation(
-    monkeypatch: pytest.MonkeyPatch, mock_prepare_vnd: Any
-) -> None:
-    """Пустой ``--violation`` → ошибка ``empty_violation``."""
-    called: list[str] = []
-
-    def counting(system, user, operation):
-        called.append(operation)
-        return _all_mock(system, user, operation)
-
-    rc, out = _run_cli(
-        "--mode", "analyze",
-        "--violation", "",
-        "--vnd", "vnd1.txt",
-        monkeypatch=monkeypatch,
-        llm_mock=counting,
-        prepare_vnd_mock=mock_prepare_vnd,
+    exit_code, stdout, _ = _run(
+        [
+            "--mode", "synthesize",
+            "--internal-format", "json",
+            "--violation", "x",
+            "--vnd", str(sample_vnd_files["file1"]),
+        ]
     )
-
-    assert rc == 2
-    parsed = json.loads(out)
-    assert parsed["data"]["error_type"] == "empty_violation"
-    assert called == []
-
-
-def test_cli_all_mode_saves_report(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_prepare_vnd: Any,
-    tmp_path: Path,
-) -> None:
-    """``--mode all --output <path>`` → сохраняет файл."""
-    output_file = tmp_path / "report.md"
-
-    rc, out = _run_cli(
-        "--mode", "all",
-        "--violation", "что-то",
-        "--vnd", "vnd1.txt",
-        "--output", str(output_file),
-        "--output-format", "md",
-        monkeypatch=monkeypatch,
-        llm_mock=_all_mock,
-        prepare_vnd_mock=mock_prepare_vnd,
-    )
-
-    assert rc == 0
-    parsed = json.loads(out)
-    assert parsed["status"] == "success"
-    assert parsed.get("saved_to") == str(output_file)
-    assert output_file.exists()
-    assert "Анализ отклонения" in output_file.read_text(encoding="utf-8")
+    assert exit_code == 0
+    payload = json.loads(stdout)
+    assert payload["status"] == "success"
+    assert payload["data"]["title"] == "Test"
 
 
-def test_cli_default_mode_is_all(
-    monkeypatch: pytest.MonkeyPatch, mock_prepare_vnd: Any
-) -> None:
-    """Без ``--mode`` → ``all`` (по умолчанию)."""
-    called = {"search_map": 0}
+# -----------------------------------------------------------------------------
+# Parametrize по всем error_type → exit code
+# -----------------------------------------------------------------------------
 
-    def counting(system, user, operation):
-        if operation == "search_map":
-            called["search_map"] += 1
-        return _all_mock(system, user, operation)
 
-    rc, out = _run_cli(
-        "--violation", "текст",
-        "--vnd", "vnd1.txt",
-        "--output-format", "md",
-        monkeypatch=monkeypatch,
-        llm_mock=counting,
-        prepare_vnd_mock=mock_prepare_vnd,
-    )
+@pytest.mark.parametrize(
+    "error_type,expected_exit",
+    [
+        ("no_vnd", 2),
+        ("vnd_not_found", 2),
+        ("vnd_unreadable", 2),
+        ("vnd_empty", 2),
+        ("too_many_chunks", 2),
+        ("empty_violation", 2),
+        ("analyze_result_unreadable", 2),
+        ("search_result_unreadable", 2),
+        ("unknown_mode", 2),
+        ("prompt_missing", 1),
+        ("prompt_unresolved_var", 1),
+        ("json_parse_failed", 1),
+        ("schema_mismatch", 1),
+        ("llm_error", 1),
+        ("io_error", 1),
+        ("internal_error", 1),
+    ],
+)
+def test_cli_exit_code_mapping(error_type: str, expected_exit: int) -> None:
+    """Все error_type → правильный exit code."""
+    assert cli._exit_code_for(
+        {"status": "error", "data": {"error_type": error_type}}
+    ) == expected_exit
 
-    assert rc == 0
-    assert called["search_map"] >= 1  # search был запущен
+
+def test_cli_exit_code_zero_for_success() -> None:
+    assert cli._exit_code_for({"status": "success", "data": {}}) == 0

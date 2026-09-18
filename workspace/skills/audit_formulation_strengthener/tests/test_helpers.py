@@ -1,132 +1,117 @@
-"""Тесты вспомогательных модулей: ``vnd_io``, ``prompts``, ``output``."""
+"""Тесты helpers: prompts, output."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-
-_SKILL_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(_SKILL_SCRIPTS))
-
-
-# ---------------------------------------------------------------------------
-# tests for vnd_io
-# ---------------------------------------------------------------------------
-
-
-def test_build_cache_key_deterministic() -> None:
-    """Тот же violation + vnd_paths → тот же cache_key."""
-    from vnd_io import build_cache_key
-
-    k1 = build_cache_key(violation="X", vnd_paths=["a.pdf", "b.pdf"])
-    k2 = build_cache_key(violation="X", vnd_paths=["b.pdf", "a.pdf"])  # другой порядок
-    # build_cache_key сортирует, так что ключи должны совпасть.
-    assert k1 == k2
-
-    k3 = build_cache_key(violation="Y", vnd_paths=["a.pdf"])
-    assert k1 != k3
+from workspace.skills.audit_formulation_strengthener.scripts.output import (
+    make_error,
+    prepare_output,
+    sanitize_output,
+)
+from workspace.skills.audit_formulation_strengthener.scripts.prompts import (
+    PromptUnresolvedVarError,
+    load_prompt,
+    render_prompt,
+)
 
 
-def test_build_cache_key_format() -> None:
-    """cache_key — 64 hex chars (SHA-256)."""
-    from vnd_io import build_cache_key
-
-    k = build_cache_key(violation="x", vnd_paths=["a"])
-    assert len(k) == 64
-    int(k, 16)  # hex-валидный
+# -----------------------------------------------------------------------------
+# load_prompt
+# -----------------------------------------------------------------------------
 
 
-def test_prepare_vnd_no_vnd_paths() -> None:
-    """Пустой список путей → VndInputError."""
-    from vnd_io import VndInputError, prepare_vnd
-
-    with pytest.raises(VndInputError) as exc_info:
-        prepare_vnd(vnd_paths=[])
-    assert exc_info.value.error_type == "no_vnd"
-
-
-def test_prepare_vnd_file_not_found(tmp_path: Path) -> None:
-    """Несуществующий файл → VndInputError(vnd_not_found)."""
-    from vnd_io import VndInputError, prepare_vnd
-
-    with pytest.raises(VndInputError) as exc_info:
-        prepare_vnd(vnd_paths=[str(tmp_path / "nope.pdf")])
-    assert exc_info.value.error_type == "vnd_not_found"
-
-
-# ---------------------------------------------------------------------------
-# tests for prompts
-# ---------------------------------------------------------------------------
-
-
-def test_load_prompt_success() -> None:
-    """Загрузка существующего промпта."""
-    from prompts import load_prompt
-
+def test_load_prompt_existing() -> None:
     text = load_prompt("analyze_system")
-    assert "старший аудитор-методолог" in text
-    assert "{{VIOLATION_TEXT}}" in text
+    assert "VIOLATION_TEXT" in text
 
 
-def test_load_prompt_missing() -> None:
-    """Несуществующий промпт → FileNotFoundError."""
-    from prompts import load_prompt
-
+def test_load_prompt_missing_raises() -> None:
     with pytest.raises(FileNotFoundError):
-        load_prompt("does_not_exist")
+        load_prompt("nonexistent_prompt_xyz")
 
 
-def test_render_prompt_substitution() -> None:
-    """Подстановка плейсхолдеров."""
-    from prompts import render_prompt
-
-    template = "Hello, {{NAME}}! You are {{ROLE}}."
-    out = render_prompt(template, {"NAME": "Аудитор", "ROLE": "методолог"})
-    assert out == "Hello, Аудитор! You are методолог."
+# -----------------------------------------------------------------------------
+# render_prompt
+# -----------------------------------------------------------------------------
 
 
-def test_render_prompt_missing_var() -> None:
-    """Отсутствующая переменная → пустая строка."""
-    from prompts import render_prompt
-
-    template = "X={{A}}, Y={{B}}"
-    out = render_prompt(template, {"A": "1"})
-    assert out == "X=1, Y="
-
-
-def test_render_prompt_none_value() -> None:
-    """``None`` → пустая строка."""
-    from prompts import render_prompt
-
-    out = render_prompt("X={{A}}", {"A": None})
-    assert out == "X="
-
-
-# ---------------------------------------------------------------------------
-# tests for output
-# ---------------------------------------------------------------------------
-
-
-def test_make_error_basic() -> None:
-    """Создание error-результата."""
-    from output import make_error
-
-    result = make_error("что-то сломалось", error_type="some_error")
-    assert result["status"] == "error"
-    assert result["data"]["error_type"] == "some_error"
-    assert "что-то сломалось" in result["data"]["message"]
-
-
-def test_make_error_extra_fields() -> None:
-    """Доп. поля добавляются в data."""
-    from output import make_error
-
-    result = make_error(
-        "ошибка",
-        error_type="io",
-        **{"retry_after_sec": 5},
+def test_render_prompt_substitutes_all() -> None:
+    out = render_prompt(
+        "Hello {{NAME}}, age {{AGE}}",
+        NAME="World",
+        AGE=42,
     )
-    assert result["data"]["retry_after_sec"] == 5
+    assert out == "Hello World, age 42"
+
+
+def test_render_prompt_none_value_becomes_empty() -> None:
+    out = render_prompt("[{{X}}]", X=None)
+    assert out == "[]"
+
+
+def test_render_prompt_unresolved_var_raises_with_name() -> None:
+    with pytest.raises(PromptUnresolvedVarError) as excinfo:
+        render_prompt("Hello {{NAME}} {{MISSING}}", NAME="World")
+    assert "MISSING" in excinfo.value.unresolved
+    assert "NAME" not in excinfo.value.unresolved
+
+
+def test_render_prompt_no_unresolved() -> None:
+    # Без {{...}} — должно вернуться как есть.
+    out = render_prompt("static text", ANY="value")
+    assert out == "static text"
+
+
+# -----------------------------------------------------------------------------
+# make_error
+# -----------------------------------------------------------------------------
+
+
+def test_make_error_with_error_type() -> None:
+    err = make_error("файл не найден", error_type="vnd_not_found")
+    assert err == {
+        "status": "error",
+        "data": {"message": "файл не найден", "error_type": "vnd_not_found"},
+    }
+
+
+def test_make_error_without_error_type() -> None:
+    err = make_error("internal")
+    assert err == {"status": "error", "data": {"message": "internal"}}
+    assert "error_type" not in err["data"]
+
+
+# -----------------------------------------------------------------------------
+# prepare_output
+# -----------------------------------------------------------------------------
+
+
+def test_prepare_output_success_envelope() -> None:
+    result = {"status": "success", "data": {"k": "v"}}
+    out = prepare_output(result, mode="analyze")
+    assert out["mode"] == "analyze"
+    assert out["status"] == "success"
+    assert out["data"] == {"k": "v"}
+
+
+def test_prepare_output_empty_result_returns_error_envelope() -> None:
+    out = prepare_output({}, mode="search")
+    assert out["status"] == "error"
+    assert "message" in out["data"]
+
+
+def test_prepare_output_uses_sanitize_for_special_types() -> None:
+    from datetime import datetime, timezone
+
+    result = {
+        "status": "success",
+        "data": {"now": datetime(2026, 9, 18, tzinfo=timezone.utc)},
+    }
+    out = prepare_output(result, mode="analyze")
+    assert isinstance(out["data"]["now"], str)  # isoformat
+
+
+def test_sanitize_output_passes_through() -> None:
+    out = sanitize_output({"x": 1})
+    assert out == {"x": 1}

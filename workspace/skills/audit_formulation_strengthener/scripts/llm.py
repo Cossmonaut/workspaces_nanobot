@@ -127,16 +127,22 @@ def chat_json(
     )
 
 
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _FENCE_LINE_RE = re.compile(r"^```")
 
 
 def _parse_json(text: str) -> dict[str, Any]:
     """Извлечь JSON-объект из ответа LLM.
 
-    Снимает ````-fence, ищет первый ``{...}`` через regex и парсит через
-    ``json.loads``. Никакой ручной балансировки скобок (замена прежнего
-    bracket-balancing).
+    Снимает ````-fence и парсит через ``json.JSONDecoder.raw_decode``,
+    который корректно обрабатывает вложенные скобки (в отличие от
+    жадного regex). Это важно для ответов вида
+    ``{"k": {"nested": 1}} и потом prose с } в тексте``.
+
+    Raises:
+        json.JSONDecodeError: если валидный JSON-объект верхнего уровня
+            не найден во всём тексте.
+        ValueError: если найден JSON, но верхнего уровня — не dict
+            (например, массив или скаляр).
     """
     text = text.strip()
     if text.startswith("```"):
@@ -147,11 +153,18 @@ def _parse_json(text: str) -> dict[str, Any]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    match = _JSON_OBJECT_RE.search(text)
-    if not match:
-        raise json.JSONDecodeError("No JSON object found in LLM response", text, 0)
-
-    obj = json.loads(match.group(0))
-    if not isinstance(obj, dict):
-        raise ValueError(f"JSON верхнего уровня — не dict: {type(obj).__name__}")
-    return obj
+    decoder = json.JSONDecoder()
+    # Перебираем все позиции `{` и пытаемся распарсить JSON-объект с этой
+    # позиции. raw_decode учитывает баланс скобок и возвращает конец объекта.
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise json.JSONDecodeError(
+        "No JSON object found in LLM response", text, 0
+    )

@@ -1,15 +1,11 @@
-"""Фикстуры для тестов ``audit_formulation_strengthener``.
+"""Pytest conftest для skill'а ``audit_formulation_strengthener``.
 
-Тесты работают против:
+Добавляет корень репо в ``sys.path`` (для пакетных импортов ``workspace.*``)
+и предоставляет общие фикстуры для mock LLM и sample VND-файлов.
 
-* **in-memory моков LLM** — без сетевых вызовов, детерминированно;
-* **in-memory моков ВНД** — текст-фикстуры в temp-файлах, не нужен
-  реальный PDF/DOCX-парсинг;
-* **без реального ``run_canonical_pipeline``** — заменён фейк-чанкером,
-  который возвращает заранее подготовленный список ``VndChunk``.
-
-Это позволяет unit-тестировать логику ``modes/`` (analyze, search,
-synthesize) и CLI без поднятия PostgreSQL / Ollama.
+Mock-граница: ``scripts.modes.<mode>.chat_json`` (через ``from ... import chat_json``
+создаётся локальное имя в режиме — мок должен ставиться на имя импортирующего
+модуля, не на исходный ``llm.chat_json``).
 """
 
 from __future__ import annotations
@@ -17,291 +13,253 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
 
-import pytest
-
-
-# ---------------------------------------------------------------------------
-# Repo-root resolution
-# ---------------------------------------------------------------------------
+# Корень репо — единственная точка модификации sys.path в test-инфраструктуре.
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
-def _ensure_repo_paths() -> None:
-    """Добавить пути к репо для импорта ``lib``, ``llm``, ``chunking``."""
-    import os
-    repo_root = Path(__file__).resolve().parent  # tests/
-    while repo_root.name != "workspaces_nanobot" and repo_root.parent != repo_root:
-        repo_root = repo_root.parent
-    # Пути, которые нужны skill'ам для импорта
-    paths_to_add = [
-        str(repo_root),  # lib/*, config.py, etc.
-        str(repo_root / "workspace" / "skills" / "legal_summarizer" / "scripts"),  # llm/*, chunking/*
-    ]
-    for p in paths_to_add:
-        if p not in sys.path:
-            sys.path.insert(0, p)
+# =============================================================================
+# Пути
+# =============================================================================
 
-
-_ensure_repo_paths()
-
-
-def _find_repo_root(start: Path) -> Path:
-    """Найти корень репо (где лежит ``workspaces_nanobot/``)."""
-    cur = start.resolve()
-    for _ in range(8):
-        if (cur / "workspaces_nanobot" / "config.py").is_file():
-            return cur
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-    raise RuntimeError(
-        f"Cannot find repo root from {start}: workspaces_nanobot/config.py not found"
-    )
-
-
-REPO_ROOT = _find_repo_root(Path(__file__).parent)
-SKILL_DIR = (
-    REPO_ROOT / "workspaces_nanobot" / "workspace" / "skills" / "audit_formulation_strengthener"
-)
+SKILL_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = SKILL_DIR / "scripts"
-CLI_PATH = SCRIPTS_DIR / "cli.py"
 PROMPTS_DIR = SKILL_DIR / "prompts"
+CLI_PATH = SCRIPTS_DIR / "cli.py"
 
 
-# ---------------------------------------------------------------------------
-# LLM mocks
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Счётчик LLM-вызовов
+# =============================================================================
 
 
-@pytest.fixture
-def mock_llm_analyze():
-    """Мок ``call_llm_json`` для analyze-фазы."""
-    canned = {
-        "normalized": "В организации установлен срок хранения персональных данных, составляющий один год.",
-        "key_concepts": ["срок хранения", "персональные данные", "1 год"],
-        "severity": "высокая",
-        "suggested_vnd_sections": ["Сроки хранения ПДн"],
-    }
+class LlmCallCounter:
+    """Считает вызовы ``chat_json`` и ``chat`` для проверки estimate-only."""
 
-    def _patch(system: str, user: str, operation: str) -> dict[str, Any]:
-        if operation == "analyze":
-            return dict(canned)
-        raise RuntimeError(f"Unexpected operation in mock: {operation}")
+    def __init__(self) -> None:
+        self.chat_json_calls = 0
+        self.chat_calls = 0
+        self.operations: list[str] = []
 
-    return _patch
+    def reset(self) -> None:
+        self.chat_json_calls = 0
+        self.chat_calls = 0
+        self.operations = []
 
 
-@pytest.fixture
-def mock_llm_search_map():
-    """Мок ``call_llm_json`` для search map-фазы.
+# =============================================================================
+# MOCK LLM
+# =============================================================================
 
-    Возвращает разные оценки для разных relation_type — чтобы можно
-    было проверить фильтрацию и re-rank.
+
+class MockLlm:
+    """Поддельный LLM-клиент с настраиваемыми ответами по ``operation``.
+
+    Использование::
+
+        mock = MockLlm()
+        mock.set_response("analyze", {"normalized": "...", "key_concepts": [], ...})
+        mock.set_response("search_map", {"relation_type": "контекст",
+                                         "relevance_score": 0.8, "why_matches": "..."})
+        mock.set_response("synthesize", {...full report...})
+
+        monkeypatch.setattr("workspace...modes.analyze.chat_json", mock.chat_json)
+        monkeypatch.setattr("workspace...modes.search.chat_json", mock.chat_json)
+        monkeypatch.setattr("workspace...modes.synthesize.chat_json", mock.chat_json)
     """
 
-    def _patch(system: str, user: str, operation: str) -> dict[str, Any]:
-        if operation != "search_map":
-            raise RuntimeError(f"Unexpected operation in mock: {operation}")
-        # Извлечь excerpt из system (после маркера ``## Фрагмент ВНД``).
-        excerpt_marker = "## Фрагмент ВНД"
-        if excerpt_marker in system:
-            excerpt_part = system.split(excerpt_marker, 1)[1][:500]
-        else:
-            excerpt_part = ""
+    def __init__(self) -> None:
+        self.counter = LlmCallCounter()
+        self._responses: dict[str, dict] = {}
+        self._fail_with_json_error_on: set[str] = set()
+        self._default_relation_type = "контекст"
+        self._default_score = 0.5
+        self._default_why = "автотест: дефолтный ответ"
 
-        # Грубая логика: по содержимому excerpt выбираем type + score.
-        if "пять лет" in excerpt_part and "1" in excerpt_part:
-            return {
-                "relation_type": "прямое_противоречие",
-                "relevance_score": 0.92,
-                "why_matches": "Установлено прямое противоречие.",
-            }
-        if "персональные данные" in excerpt_part:
-            return {
-                "relation_type": "косвенное_отношение",
-                "relevance_score": 0.55,
-                "why_matches": "Косвенное отношение.",
-            }
-        if "нерелевантный" in excerpt_part.lower():
-            return {
-                "relation_type": "нерелевантно",
-                "relevance_score": 0.05,
-                "why_matches": "",
-            }
-        return {
-            "relation_type": "контекст",
-            "relevance_score": 0.40,
-            "why_matches": "Общий контекст.",
-        }
+    def set_response(self, operation: str, payload: dict) -> None:
+        self._responses[operation] = payload
 
-    return _patch
+    def make_all_search_fail_with_json_error(self) -> None:
+        """Сценарий: все чанки в search проваливаются на JSON-парсинге."""
+        self._fail_with_json_error_on.add("search_map")
 
+    def chat(self, messages, *, context=None, **kwargs) -> str:  # noqa: ARG002
+        """Свободный текст: возвращает простой JSON в строковом виде."""
+        self.counter.chat_calls += 1
+        op = "synthesize"
+        payload = self._responses.get(op, {"ok": True})
+        return json.dumps(payload, ensure_ascii=False)
 
-@pytest.fixture
-def mock_llm_synthesize():
-    """Мок ``call_llm_json`` для synthesize-фазы."""
-    canned = {
-        "title": "Анализ отклонения: срок хранения ПДн",
-        "violation_summary": [
-            "В организации установлен срок хранения персональных данных, составляющий один год."
-        ],
-        "established_facts": [
-            "В соответствии с пунктом ВНД минимальный срок хранения ПДн — пять лет."
-        ],
-        "deviation_analysis": [
-            "Установлено прямое противоречие между фактическим сроком хранения и требованиями ВНД."
-        ],
-        "vnd_citations": [
-            {
-                "source_file": "vnd1.txt",
-                "section_title": "5.4 Сроки хранения",
-                "section_path": "5 / 5.4",
-                "excerpt": "Срок хранения ПДн — не менее пяти лет.",
-                "relation_type": "прямое_противоречие",
-                "relation_explanation": "Прямое противоречие.",
-            }
-        ],
-        "verdict": {
-            "category": "высокая",
-            "verdict_text": ["Отклонение классифицируется как высокой тяжести."],
-        },
-        "recommended_formulation": [
-            "В ходе проверки установлено нарушение пункта 5.4 ВНД в части хранения ПДн в течение одного года при минимальном установленном сроке пять лет."
-        ],
-    }
+    def chat_json(
+        self,
+        *,
+        system: str,  # noqa: ARG002
+        user: str,  # noqa: ARG002
+        operation: str = "afs",
+    ) -> dict:
+        """Структурированный вызов: возвращает dict по ``operation``."""
+        self.counter.chat_json_calls += 1
+        self.counter.operations.append(operation)
 
-    def _patch(system: str, user: str, operation: str) -> dict[str, Any]:
-        if operation == "synthesize":
-            return dict(canned)
-        raise RuntimeError(f"Unexpected operation in mock: {operation}")
+        if operation in self._fail_with_json_error_on:
+            raise json.JSONDecodeError("Test-induced parse failure", "", 0)
 
-    return _patch
+        if operation in self._responses:
+            return self._responses[operation]
 
-
-@pytest.fixture
-def mock_llm_all(mock_llm_analyze, mock_llm_search_map, mock_llm_synthesize):
-    """Мок всех трёх LLM-фаз через единую точку входа."""
-
-    def _patch(system: str, user: str, operation: str) -> dict[str, Any]:
+        # Дефолты по типу операции.
         if operation == "analyze":
-            return mock_llm_analyze(system, user, operation)
+            return {
+                "normalized": "нормализованная формулировка (default mock)",
+                "key_concepts": ["default_mock"],
+                "severity": "средняя",
+                "suggested_vnd_sections": [],
+            }
         if operation == "search_map":
-            return mock_llm_search_map(system, user, operation)
+            return {
+                "relation_type": self._default_relation_type,
+                "relevance_score": self._default_score,
+                "why_matches": self._default_why,
+            }
         if operation == "synthesize":
-            return mock_llm_synthesize(system, user, operation)
-        raise RuntimeError(f"Unexpected operation in mock: {operation}")
+            return {
+                "title": "Mock-отчёт",
+                "violation_summary": ["default mock summary"],
+                "established_facts": ["default mock fact"],
+                "deviation_analysis": ["default mock analysis"],
+                "vnd_citations": [],
+                "verdict": {"category": "средняя", "verdict_text": ["mock verdict"]},
+                "recommended_formulation": ["default mock formulation"],
+            }
+        return {}
 
-    return _patch
+
+# =============================================================================
+# Фикстуры
+# =============================================================================
 
 
-# ---------------------------------------------------------------------------
-# VND mocks
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def sample_vnd_chunks():
-    """Список заранее подготовленных ``VndChunk``-подобных объектов.
-
-    Используется для подмены ``vnd_io.prepare_vnd``.
-    Возвращает объекты с атрибутами (не dict), чтобы соответствовать
-    интерфейсу ``VndChunk`` из ``vnd_chunker``.
-    """
-    from types import SimpleNamespace
-
-    return [
-        SimpleNamespace(
-            source_file="vnd1.txt",
-            index=0,
-            text="Срок хранения персональные данные — не менее пяти лет. (пункт 5.4)",
-            section_title="5.4 Сроки хранения",
-            section_path="5 / 5.4 Сроки хранения",
-            token_estimate=50,
-        ),
-        SimpleNamespace(
-            source_file="vnd1.txt",
-            index=1,
-            text="Раздел о правах субъектов персональные данные.",
-            section_title="6.1 Права субъектов",
-            section_path="6 / 6.1 Права",
-            token_estimate=30,
-        ),
-        SimpleNamespace(
-            source_file="vnd2.txt",
-            index=0,
-            text="Нерелевантный фрагмент про офисные процедуры.",
-            section_title="1.1 Общие положения",
-            section_path="1 / 1.1",
-            token_estimate=20,
-        ),
-    ]
+import pytest  # noqa: E402
 
 
 @pytest.fixture
-def mock_prepare_vnd(sample_vnd_chunks):
-    """Мок ``vnd_io.prepare_vnd`` — возвращает заранее заготовленные чанки.
+def mock_llm() -> MockLlm:
+    """Фикстура: возвращает ``MockLlm``-инстанс (без monkeypatch).
 
-    Подменяет на уровне модуля ``modes.search`` (и ``modes.synthesize``,
-    если тот начнёт ходить в ВНД).
+    Использование::
+
+        def test_x(mock_llm, monkeypatch):
+            monkeypatch.setattr(
+                "workspace.skills.audit_formulation_strengthener.scripts.modes.analyze.chat_json",
+                mock_llm.chat_json,
+            )
     """
-    # Импортируем dataclass здесь, чтобы избежать проблем с sys.path
-    import sys
-    from pathlib import Path
-    _SKILL_ROOT = Path(__file__).resolve().parent.parent
-    _SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-    for _p in [str(_SCRIPTS_DIR), str(_SKILL_ROOT.parent.parent.parent), str(_SKILL_ROOT.parent.parent / "workspace" / "skills" / "legal_summarizer" / "scripts")]:
-        if _p not in sys.path:
-            sys.path.insert(0, _p)
+    return MockLlm()
 
-    from vnd_io import VndBundle
 
-    def _fake(*args: Any, **kwargs: Any):
-        return VndBundle(
-            vnd_paths=kwargs.get("vnd_paths") or [],
-            chunks=sample_vnd_chunks,
-            cache_key="test_cache_key_" + "x" * 56,
-            size_estimate={
-                "vnd_files": len(kwargs.get("vnd_paths") or []),
-                "total_chars": 1000,
-                "total_pages_estimated": 1,
-                "chunks_estimated": len(sample_vnd_chunks),
-                "map_batches_planned": len(sample_vnd_chunks),
+@pytest.fixture
+def mock_llm_all(mock_llm: MockLlm, monkeypatch: pytest.MonkeyPatch):
+    """Подменяет ``chat_json`` во всех трёх режимах на ``mock_llm``."""
+    targets = (
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.analyze",
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.search",
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.synthesize",
+    )
+    for t in targets:
+        mod = __import__(t, fromlist=["chat_json"])
+        monkeypatch.setattr(mod, "chat_json", mock_llm.chat_json)
+    return mock_llm
+
+
+@pytest.fixture
+def sample_vnd_files(tmp_path: Path) -> dict[str, Path]:
+    """Создаёт 2 tmp-файла ВНД с реальным текстом + 1 пустой файл.
+
+    Возвращает dict ``{"file1": Path, "file2": Path, "empty": Path}``.
+    ``empty`` — пустой файл для теста ``vnd_empty``.
+    """
+    file1 = tmp_path / "vnd1.txt"
+    file1.write_text(
+        "1.1 Срок хранения персональных данных — 1 год с момента сбора.\n\n"
+        "1.2 Уничтожение данных осуществляется в срок не более 30 дней.\n",
+        encoding="utf-8",
+    )
+    file2 = tmp_path / "vnd2.txt"
+    file2.write_text(
+        "2.1 Передача ПДн третьим лицам допускается только с письменного согласия.\n",
+        encoding="utf-8",
+    )
+    empty = tmp_path / "empty.txt"
+    empty.write_text("", encoding="utf-8")
+    return {"file1": file1, "file2": file2, "empty": empty}
+
+
+def make_analyze_result(
+    *,
+    normalized: str = "нормализованная формулировка",
+    severity: str = "средняя",
+    key_concepts: list[str] | None = None,
+    suggested_vnd_sections: list[str] | None = None,
+    raw_text: str = "raw text",
+) -> dict:
+    """Собрать dict в формате результата ``modes.analyze.run``."""
+    return {
+        "status": "success",
+        "data": {
+            "raw_text": raw_text,
+            "normalized": normalized,
+            "key_concepts": key_concepts if key_concepts is not None else ["пдн", "хранение"],
+            "severity": severity,
+            "suggested_vnd_sections": suggested_vnd_sections if suggested_vnd_sections is not None else [],
+        },
+    }
+
+
+def make_search_result(
+    *,
+    findings: list[dict] | None = None,
+    chunks_total: int = 3,
+    chunks_processed: int = 3,
+    chunks_failed: int = 0,
+    chunks_relevant_total: int | None = None,
+    normalized_violation_used: str = "нормализованная формулировка",
+) -> dict:
+    """Собрать dict в формате результата ``modes.search.run``."""
+    if findings is None:
+        findings = [
+            {
+                "evidence_id": "F1",
+                "source_file": "vnd1.txt",
+                "chunk_index": 0,
+                "text_excerpt": "Срок хранения ПДн — 1 год.",
+                "relation_type": "прямое_противоречие",
+                "relevance_score": 0.85,
+                "why_matches": "прямо противоречит формулировке отклонения",
             },
-        )
-
-    return _fake
-
-
-@pytest.fixture
-def tmp_vnd_files(tmp_path: Path) -> list[str]:
-    """Создать temp-файлы с короткими ВНД-фрагментами."""
-    files: list[str] = []
-    for i, content in enumerate(
-        [
-            "Раздел 5.4 Сроки хранения: персональные данные хранятся пять лет.",
-            "Раздел 6.1 Права субъектов персональные данные.",
+            {
+                "evidence_id": "F2",
+                "source_file": "vnd2.txt",
+                "chunk_index": 1,
+                "text_excerpt": "Передача ПДн третьим лицам.",
+                "relation_type": "контекст",
+                "relevance_score": 0.4,
+                "why_matches": "контекст по смежной теме",
+            },
         ]
-    ):
-        p = tmp_path / f"vnd{i}.txt"
-        p.write_text(content, encoding="utf-8")
-        files.append(str(p))
-    return files
-
-
-# ---------------------------------------------------------------------------
-# Path helpers
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def scripts_dir() -> Path:
-    """Абсолютный путь к ``scripts/`` skill'а."""
-    return SCRIPTS_DIR
-
-
-@pytest.fixture
-def cli_path() -> Path:
-    """Абсолютный путь к ``scripts/cli.py``."""
-    return CLI_PATH
+    return {
+        "status": "success",
+        "data": {
+            "vnd_findings": findings,
+            "vnd_chunks_total": chunks_total,
+            "chunks_processed": chunks_processed,
+            "chunks_failed": chunks_failed,
+            "chunks_relevant_total": (
+                chunks_relevant_total if chunks_relevant_total is not None else len(findings)
+            ),
+            "top_k_candidates": 10,
+            "min_relevance_score": 0.3,
+            "normalized_violation_used": normalized_violation_used,
+        },
+    }

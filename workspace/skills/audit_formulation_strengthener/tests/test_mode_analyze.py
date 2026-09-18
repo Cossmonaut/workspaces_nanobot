@@ -1,131 +1,142 @@
-"""Тесты режима ``analyze`` — нормализация отклонения через LLM."""
+"""Тесты режима ``analyze``."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-
-# Импортируем модуль (для изоляции подменяем мок LLM на уровне импорта).
-_SKILL_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(_SKILL_SCRIPTS))
+from workspace.skills.audit_formulation_strengthener.scripts.modes import analyze
+from workspace.skills.audit_formulation_strengthener.scripts.llm import JsonParseError
 
 
-def test_analyze_empty_violation() -> None:
-    """Пустая формулировка → ошибка ``empty_violation``."""
-    from modes import analyze
-
-    result, report_text = analyze.run(violation="")
-    assert result["status"] == "error"
-    assert result["data"]["error_type"] == "empty_violation"
-    assert report_text is None
+# -----------------------------------------------------------------------------
+# estimate-only (без LLM)
+# -----------------------------------------------------------------------------
 
 
-def test_analyze_whitespace_only_violation() -> None:
-    """Только пробелы → ошибка ``empty_violation``."""
-    from modes import analyze
-
-    result, _ = analyze.run(violation="   \n\t  ")
-    assert result["status"] == "error"
-    assert result["data"]["error_type"] == "empty_violation"
-
-
-def test_analyze_estimate_only() -> None:
-    """``--estimate-only`` → нет LLM-вызова, возвращает оценку."""
-    from modes import analyze
-
-    result, report_text = analyze.run(
-        violation="Срок хранения ПДн — 1 год",
+def test_estimate_only_without_vnd() -> None:
+    result, report = analyze.run(
+        violation="Срок хранения ПДн установлен 1 год",
+        vnd_paths=None,
         estimate_only=True,
     )
     assert result["status"] == "success"
-    assert result["data"]["violation_chars"] == len("Срок хранения ПДн — 1 год")
+    assert result["data"]["estimate"] is True
+    assert result["data"]["vnd_count"] == 0
     assert result["data"]["llm_calls_planned"] == 1
-    assert report_text is None
+    assert "violation_chars" in result["data"]
+    assert report is None
 
 
-def test_analyze_success_with_mock_llm(mock_llm_analyze) -> None:
-    """Полный успешный прогон analyze с моком LLM."""
-    from modes import analyze
+def test_estimate_only_with_vnd_counts_paths() -> None:
+    result, _ = analyze.run(
+        violation="x",
+        vnd_paths=["a.pdf", "b.pdf", "c.pdf"],
+        estimate_only=True,
+    )
+    assert result["data"]["vnd_count"] == 3
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(analyze, "call_llm_json", mock_llm_analyze)
-        result, report_text = analyze.run(
-            violation="Срок хранения персональные данные — 1 год"
-        )
 
+def test_empty_violation_returns_empty_violation_error(mock_llm_all) -> None:
+    result, _ = analyze.run(violation="   ", estimate_only=False)
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "empty_violation"
+    assert mock_llm_all.counter.chat_json_calls == 0
+
+
+# -----------------------------------------------------------------------------
+# LLM flow
+# -----------------------------------------------------------------------------
+
+
+def test_success_path(mock_llm_all, monkeypatch) -> None:
+    mock_llm_all.set_response(
+        "analyze",
+        {
+            "normalized": "Срок хранения ПДн — 1 год.",
+            "key_concepts": ["пдн", "хранение"],
+            "severity": "высокая",
+            "suggested_vnd_sections": ["5. Сроки"],
+        },
+    )
+    result, report = analyze.run(
+        violation="Срок хранения ПДн установлен 1 год",
+    )
     assert result["status"] == "success"
-    data = result["data"]
-    assert data["normalized"].startswith("В организации")
-    assert "срок хранения" in data["key_concepts"]
-    assert "персональные данные" in data["key_concepts"]
-    assert data["severity"] == "высокая"
-    assert "Сроки хранения ПДн" in data["suggested_vnd_sections"]
-    assert report_text is None
+    assert result["data"]["normalized"] == "Срок хранения ПДн — 1 год."
+    assert result["data"]["key_concepts"] == ["пдн", "хранение"]
+    assert result["data"]["severity"] == "высокая"
+    assert result["data"]["suggested_vnd_sections"] == ["5. Сроки"]
+    assert report is None
+    assert mock_llm_all.counter.chat_json_calls == 1
 
 
-def test_analyze_severity_normalization(mock_llm_analyze) -> None:
-    """LLM вернул нестандартный severity → нормализуется в 'средняя'."""
-    from modes import analyze
-
-    def bad_severity(system, user, operation):
-        d = dict(mock_llm_analyze(system, user, operation))
-        d["severity"] = "критическая!!"
-        return d
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(analyze, "call_llm_json", bad_severity)
-        result, _ = analyze.run(violation="...любой текст...")
-
+def test_invalid_severity_coerced_to_medium(mock_llm_all) -> None:
+    mock_llm_all.set_response(
+        "analyze",
+        {
+            "normalized": "X",
+            "key_concepts": [],
+            "severity": "катастрофическая",
+            "suggested_vnd_sections": [],
+        },
+    )
+    result, _ = analyze.run(violation="X")
     assert result["status"] == "success"
     assert result["data"]["severity"] == "средняя"
 
 
-def test_analyze_invalid_json_after_retries() -> None:
-    """LLM возвращает невалидный JSON после всех попыток → json_parse_failed."""
-    from modes import analyze
-    from llm_client import JsonParseError
-
-    def raises(system, user, operation):
-        raise JsonParseError("invalid JSON")
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(analyze, "call_llm_json", raises)
-        result, _ = analyze.run(violation="что-то")
-
-    assert result["status"] == "error"
-    assert result["data"]["error_type"] == "json_parse_failed"
+def test_key_concepts_filters_non_strings(mock_llm_all) -> None:
+    mock_llm_all.set_response(
+        "analyze",
+        {
+            "normalized": "X",
+            "key_concepts": ["valid", 42, 3.14, None, "", "  ", "another"],
+            "severity": "средняя",
+            "suggested_vnd_sections": [],
+        },
+    )
+    result, _ = analyze.run(violation="X")
+    assert result["data"]["key_concepts"] == ["valid", "42", "3.14", "another"]
 
 
-def test_analyze_schema_mismatch(mock_llm_analyze) -> None:
-    """LLM вернул dict без ``normalized`` → schema_mismatch."""
-    from modes import analyze
-
-    def no_normalized(system, user, operation):
-        return {"key_concepts": [], "severity": "средняя"}
-
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(analyze, "call_llm_json", no_normalized)
-        result, _ = analyze.run(violation="что-то")
-
+def test_schema_mismatch_when_normalized_missing(mock_llm_all) -> None:
+    mock_llm_all.set_response(
+        "analyze",
+        {"key_concepts": [], "severity": "средняя"},
+    )
+    result, _ = analyze.run(violation="X")
     assert result["status"] == "error"
     assert result["data"]["error_type"] == "schema_mismatch"
 
 
-def test_analyze_extras_preserved(mock_llm_analyze) -> None:
-    """Дополнительные поля от LLM (например, ``notes``) сохраняются в ``extras``."""
-    from modes import analyze
+def test_json_parse_failed_after_two_attempts(
+    mock_llm_all, monkeypatch
+) -> None:
+    # Заставляем chat всегда возвращать мусор (не JSON).
+    def bad_chat_json(**kwargs):
+        raise JsonParseError("Test-induced", raw_text="not json", attempt=2)
 
-    def with_extras(system, user, operation):
-        d = dict(mock_llm_analyze(system, user, operation))
-        d["notes"] = "дополнительные пояснения"
-        return d
+    analyze_mod = __import__(
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.analyze",
+        fromlist=["chat_json"],
+    )
+    monkeypatch.setattr(analyze_mod, "chat_json", bad_chat_json)
 
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(analyze, "call_llm_json", with_extras)
-        result, _ = analyze.run(violation="...")
+    result, _ = analyze.run(violation="X")
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "json_parse_failed"
 
-    assert result["status"] == "success"
-    assert result["data"].get("extras", {}).get("notes") == "дополнительные пояснения"
+
+def test_llm_error_on_unexpected_exception(mock_llm_all, monkeypatch) -> None:
+    def explode(**kwargs):
+        raise RuntimeError("boom")
+
+    analyze_mod = __import__(
+        "workspace.skills.audit_formulation_strengthener.scripts.modes.analyze",
+        fromlist=["chat_json"],
+    )
+    monkeypatch.setattr(analyze_mod, "chat_json", explode)
+
+    result, _ = analyze.run(violation="X")
+    assert result["status"] == "error"
+    assert result["data"]["error_type"] == "llm_error"
