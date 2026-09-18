@@ -1,9 +1,12 @@
-"""Тесты helpers: prompts, output."""
+"""Тесты helpers: prompts, output, llm._parse_json."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from workspace.skills.audit_formulation_strengthener.scripts.llm import _parse_json
 from workspace.skills.audit_formulation_strengthener.scripts.output import (
     make_error,
     prepare_output,
@@ -115,3 +118,36 @@ def test_prepare_output_uses_sanitize_for_special_types() -> None:
 def test_sanitize_output_passes_through() -> None:
     out = sanitize_output({"x": 1})
     assert out == {"x": 1}
+
+
+# -----------------------------------------------------------------------------
+# llm._parse_json (К4: корректный парсинг JSON + хвостовая prose с })
+# -----------------------------------------------------------------------------
+
+
+def test_llm_parse_json_handles_trailing_prose_with_brace() -> None:
+    """К4 фикс-тест: ``raw_decode`` парсит JSON до баланса скобок.
+
+    Жадный regex (r'{.*}', re.DOTALL) захватывал бы до последней }
+    в тексте — для ответа LLM вида ``{"k":1} и потом prose с } здесь``
+    это давало бы невалидный JSON.
+
+    ``raw_decode`` корректно учитывает баланс скобок и возвращает
+    первый валидный JSON-объект.
+    """
+    # JSON-объект + хвостовая prose с лишней }.
+    assert _parse_json('{"key": "value"} and then some text with } in it.') == {
+        "key": "value"
+    }
+
+    # JSON с вложенным объектом + prose после.
+    text2 = '{"outer": {"inner": 1}, "ok": true} trailing text with } brace'
+    assert _parse_json(text2) == {"outer": {"inner": 1}, "ok": True}
+
+    # ```-fenced JSON + prose после.
+    text3 = '```json\n{"fenced": 1}\n```\n then prose with } brace'
+    assert _parse_json(text3) == {"fenced": 1}
+
+    # Никакого JSON → JSONDecodeError.
+    with pytest.raises(json.JSONDecodeError):
+        _parse_json("no json here at all")
