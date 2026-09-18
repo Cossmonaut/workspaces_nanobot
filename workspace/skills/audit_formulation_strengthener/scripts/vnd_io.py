@@ -1,54 +1,77 @@
-"""Высокоуровневый I/O слой для ВНД.
-
-Содержит:
+"""Высокоуровневый I/O слой для ВНД: извлечение текста + чанкование + оценка.
 
 * ``VndInputError`` — типизированное исключение для CLI;
-* ``prepare_vnd`` — фасад: принимает список путей, возвращает
-  структурированный набор чанков + оценку размера + cache-key.
+* ``VndChunk`` — frozen-dataclass с метаданными чанка;
+* ``VndBundle`` — результат ``prepare_vnd``: готовые чанки + ``size_estimate``;
+* ``prepare_vnd`` — фасад: принимает список путей, извлекает текст через
+  ``workspace.utils.office_files.extract_text``, чанкует через
+  ``lib.services.text_splitter.split_text``.
 
-Используется ``modes/search`` и ``modes/synthesize``. Не используется
-``modes/analyze`` (нормализация отклонения не требует чтения ВНД).
+Без секций (D13 fix): ``text_splitter.split_text`` не знает про разделы.
+Цитата = ``(source_file, chunk_index, text_excerpt)``.
+
+Без ``cache_key``: SHA-256-ключ прежней реализации был мёртвым полем,
+удалён вместе с vnd_chunking/ (D11/D16 fix).
 """
 
 from __future__ import annotations
 
-import hashlib
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Добавляем пути в sys.path для импорта.
-_SKILL_ROOT = Path(__file__).resolve().parent.parent
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-_REPO_ROOT = _SKILL_ROOT.parents[2]
-_LS_SCRIPTS = str(_REPO_ROOT / "workspace" / "skills" / "legal_summarizer" / "scripts")
+from lib.core.skill_config import get_tool_config
+from lib.services.text_splitter import split_text
+from workspace.utils.office_files import extract_text
 
-# Добавляем пути
-_paths = [str(_SCRIPTS_DIR), str(_REPO_ROOT), _LS_SCRIPTS]
-for _p in _paths:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from vnd_chunking import vnd_chunker  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.skill_config import (
+    get_chunking_config,
+)
 
 
-__all__ = ["VndInputError", "VndBundle", "prepare_vnd", "build_cache_key"]
+_SKILL_NAME = "audit_formulation_strengthener"
+
+
+__all__ = ["VndInputError", "VndChunk", "VndBundle", "prepare_vnd"]
 
 
 class VndInputError(Exception):
-    """Ошибка ввода ВНД: файл не найден, не читается и т.п.
+    """Ошибка ввода ВНД: файл не найден, не читается, пустой и т.п.
 
     Attributes:
-        error_type: машинно-читаемая категория (например,
-            ``"vnd_not_found"``, ``"vnd_unreadable"``).
+        error_type: машинно-читаемая категория (``no_vnd``,
+            ``vnd_not_found``, ``vnd_unreadable``, ``vnd_empty``,
+            ``too_many_chunks``).
         message: человекочитаемое сообщение.
+        file: путь к проблемному файлу (если применимо).
     """
 
-    def __init__(self, message: str, error_type: str = "vnd_input_error") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "vnd_input_error",
+        file: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.message = message
+        self.file = file
+
+
+@dataclass(frozen=True)
+class VndChunk:
+    """Чанк ВНД.
+
+    Attributes:
+        source_file: путь к файлу-источнику (как передан в CLI).
+        index: глобальный порядковый номер чанка (0-based, по всем файлам).
+        text: текст чанка.
+    """
+
+    source_file: str
+    index: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -56,98 +79,125 @@ class VndBundle:
     """Подготовленный набор чанков ВНД.
 
     Attributes:
-        vnd_paths: список исходных путей (для traceability в отчёте).
+        vnd_paths: список исходных путей (для traceability).
         chunks: список ``VndChunk``.
-        cache_key: детерминированный ключ для кэширования
-            (SHA-256 от violation + sorted(vnd_paths)).
-        size_estimate: оценка размера (см. ``estimate_vnd_size``).
+        size_estimate: словарь ``{files, chunks_total, chunks_per_file, chars_total}``.
     """
 
     vnd_paths: list[str]
-    chunks: list[Any]  # VndChunk из vnd_chunker
-    cache_key: str
+    chunks: list[VndChunk]
     size_estimate: dict[str, Any]
 
 
 def prepare_vnd(
     vnd_paths: list[str],
     *,
-    violation: str = "",
-    max_chunks_per_file: int | None = None,
+    max_chunks: int | None = None,
 ) -> VndBundle:
-    """Подготовить ВНД: извлечь чанки, оценить размер, построить cache_key.
+    """Подготовить ВНД: извлечь текст, чанковать, оценить размер.
 
     Args:
-        vnd_paths: список путей к файлам ВНД.
-        violation: текст отклонения (используется в cache_key;
-            опционально, чтобы можно было строить кэш и без violation).
-        max_chunks_per_file: ограничение числа чанков на файл.
+        vnd_paths: список путей к файлам ВНД (.pdf/.docx/.txt).
+        max_chunks: явное ограничение суммарного числа чанков. Если None —
+            берётся из ``project.json::skills.audit_formulation_strengthener.
+            execution.max_chunks_for_execution``. Если None и в конфиге нет —
+            без ограничения.
 
     Returns:
-        ``VndBundle`` с готовыми чанками и метаданными.
+        ``VndBundle`` с готовыми чанками и ``size_estimate``.
 
     Raises:
-        VndInputError: при ошибках ввода (файл не найден / не читается).
+        VndInputError: при любой ошибке ввода.
     """
     if not vnd_paths:
         raise VndInputError("Не указаны файлы ВНД", error_type="no_vnd")
 
-    # 1. Проверка существования.
-    missing: list[str] = [p for p in vnd_paths if not Path(p).exists()]
+    # 1. Проверка существования всех файлов.
+    missing = [p for p in vnd_paths if not Path(p).exists()]
     if missing:
         raise VndInputError(
             f"Не найдены файлы ВНД: {', '.join(missing)}",
             error_type="vnd_not_found",
         )
 
-    # 2. Извлечение чанков.
-    try:
-        chunks = vnd_chunker.extract_vnd_chunks(
-            vnd_paths, max_chunks_per_file=max_chunks_per_file
-        )
-    except FileNotFoundError as exc:
-        raise VndInputError(str(exc), error_type="vnd_not_found") from exc
-    except RuntimeError as exc:
-        raise VndInputError(str(exc), error_type="vnd_unreadable") from exc
+    # 2. Извлечение текста и чанкование.
+    chunking = get_chunking_config()
+    chunk_size = int(chunking.get("chunk_size", 6000))
+    chunk_overlap = int(chunking.get("chunk_overlap", 400))
 
-    if not chunks:
+    chunks: list[VndChunk] = []
+    chunks_per_file: list[int] = []
+    chars_total = 0
+    global_index = 0
+
+    for path_str in vnd_paths:
+        path = Path(path_str)
+        # 2a. Извлечь текст в try/except — любое исключение → vnd_unreadable.
+        try:
+            text = extract_text(path)
+        except FileNotFoundError as exc:
+            # Защита от race condition: файл удалён между exists() и extract.
+            raise VndInputError(
+                f"Файл ВНД исчез во время обработки: {path}",
+                error_type="vnd_not_found",
+                file=str(path),
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise VndInputError(
+                f"Не удалось прочитать файл ВНД '{path}': {exc!r}",
+                error_type="vnd_unreadable",
+                file=str(path),
+            ) from exc
+
+        # 2b. Пустой текст → vnd_empty С ИМЕНЕМ ФАЙЛА (D4 fix).
+        if not text or not text.strip():
+            raise VndInputError(
+                f"Файл ВНД '{path}' не содержит текста "
+                f"(скан без OCR, битый файл или пустой).",
+                error_type="vnd_empty",
+                file=str(path),
+            )
+
+        # 2c. Чанкование.
+        file_chunks_text = split_text(
+            text, chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+        )
+
+        per_file_count = 0
+        for chunk_text in file_chunks_text:
+            chunks.append(
+                VndChunk(source_file=str(path), index=global_index, text=chunk_text)
+            )
+            global_index += 1
+            per_file_count += 1
+        chunks_per_file.append(per_file_count)
+        chars_total += len(text)
+
+    # 3. Лимит на суммарное число чанков (D5 fix).
+    if max_chunks is None:
+        tool_cfg = get_tool_config(_SKILL_NAME)
+        configured = tool_cfg.get("execution", {}).get("max_chunks_for_execution")
+        if configured is not None:
+            max_chunks = int(configured)
+
+    if max_chunks is not None and len(chunks) > max_chunks:
         raise VndInputError(
-            "Не удалось извлечь ни одного чанка из ВНД. "
-            "Возможно, файлы пусты или не содержат текстового слоя.",
-            error_type="vnd_empty",
+            f"Слишком много чанков: {len(chunks)} > {max_chunks} "
+            f"(лимит execution.max_chunks_for_execution). "
+            f"Уменьшите число ВНД или увеличьте chunk_size.",
+            error_type="too_many_chunks",
         )
 
-    # 3. Оценка размера (для --estimate-only и пользовательского UI).
-    size_estimate = vnd_chunker.estimate_vnd_size(vnd_paths)
-
-    # 4. Cache key.
-    cache_key = build_cache_key(violation=violation, vnd_paths=vnd_paths)
+    # 4. size_estimate.
+    size_estimate: dict[str, Any] = {
+        "files": len(vnd_paths),
+        "chunks_total": len(chunks),
+        "chunks_per_file": chunks_per_file,
+        "chars_total": chars_total,
+    }
 
     return VndBundle(
         vnd_paths=list(vnd_paths),
         chunks=chunks,
-        cache_key=cache_key,
         size_estimate=size_estimate,
     )
-
-
-def build_cache_key(*, violation: str, vnd_paths: list[str]) -> str:
-    """Построить детерминированный ключ кэша.
-
-    SHA-256 от ``violation + sorted(vnd_paths)``. Один и тот же набор
-    ВНД + одна и та же формулировка → один cache_key → можно
-    переиспользовать результат analyze/search.
-
-    Args:
-        violation: текст отклонения.
-        vnd_paths: список путей к ВНД.
-
-    Returns:
-        64-char hex string.
-    """
-    h = hashlib.sha256()
-    h.update(violation.encode("utf-8", errors="replace"))
-    for p in sorted(vnd_paths):
-        h.update(b"\x00")
-        h.update(p.encode("utf-8", errors="replace"))
-    return h.hexdigest()

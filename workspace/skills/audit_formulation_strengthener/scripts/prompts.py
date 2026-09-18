@@ -1,25 +1,43 @@
 """Загрузка и рендеринг system-промптов skill'а.
 
 Промпты лежат в ``prompts/*.md`` рядом со ``scripts/`` (один уровень вверх).
-Шаблон подставляется через ``str.replace`` (плейсхолдеры вида ``{{NAME}}``).
+Шаблон подставляется через ``render_prompt(template, **vars)`` —
+плейсхолдеры вида ``{{NAME}}``.
 
-Не используем jinja2 — намеренно держим минимум зависимостей.
+Жёсткая проверка: после подстановки не должно остаться неразрешённых
+``{{...}}`` — иначе ``PromptUnresolvedVarError`` (защита от тихих остатков).
 """
 
 from __future__ import annotations
 
-import sys
+import re
 from pathlib import Path
 from typing import Any
+
 
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _PROMPTS_DIR = _SKILL_ROOT / "prompts"
 
-if str(_SKILL_ROOT / "scripts") not in sys.path:
-    sys.path.insert(0, str(_SKILL_ROOT / "scripts"))
+
+__all__ = ["load_prompt", "render_prompt", "PromptUnresolvedVarError"]
 
 
-__all__ = ["load_prompt", "render_prompt"]
+class PromptUnresolvedVarError(Exception):
+    """В шаблоне остались неразрешённые плейсхолдеры ``{{...}}`` после подстановки.
+
+    Attributes:
+        unresolved: список имён неразрешённых плейсхолдеров (без ``{{``/``}}``).
+        template: исходный шаблон (для диагностики).
+    """
+
+    def __init__(self, message: str, *, unresolved: list[str], template: str) -> None:
+        super().__init__(message)
+        self.unresolved = unresolved
+        self.template = template
+
+
+_PLACEHOLDER_RE = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
+_UNRESOLVED_ANY_RE = re.compile(r"\{\{[^{}]*\}\}")
 
 
 def load_prompt(name: str) -> str:
@@ -40,25 +58,40 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def render_prompt(template: str, variables: dict[str, Any]) -> str:
+def render_prompt(template: str, **vars: Any) -> str:
     """Подставить переменные в шаблон.
 
-    Плейсхолдеры: ``{{NAME}}`` (регистрозависимые). Значения приводятся
-    к ``str`` через ``str()``. ``None`` заменяется на пустую строку.
+    Плейсхолдеры: ``{{NAME}}`` (uppercase/underscore, цифры после первой буквы).
+    Значения приводятся к ``str`` через ``str()``. ``None`` заменяется на
+    пустую строку.
 
     Args:
         template: шаблон с плейсхолдерами.
-        variables: dict с переменными.
+        **vars: переменные для подстановки.
 
     Returns:
         Шаблон с подставленными значениями.
+
+    Raises:
+        PromptUnresolvedVarError: если в шаблоне остались неразрешённые
+            ``{{...}}`` после подстановки (включая имена, не переданные
+            в ``**vars``).
     """
-    out = template
-    for key, value in variables.items():
-        placeholder = "{{" + key + "}}"
-        if value is None:
-            replacement = ""
-        else:
-            replacement = str(value)
-        out = out.replace(placeholder, replacement)
-    return out
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in vars:
+            return match.group(0)
+        value = vars[key]
+        return "" if value is None else str(value)
+
+    rendered = _PLACEHOLDER_RE.sub(repl, template)
+
+    remaining = _UNRESOLVED_ANY_RE.findall(rendered)
+    if remaining:
+        names = sorted({p.strip("{}").strip() for p in remaining})
+        raise PromptUnresolvedVarError(
+            f"В шаблоне остались неразрешённые плейсхолдеры: {names}",
+            unresolved=names,
+            template=template,
+        )
+    return rendered

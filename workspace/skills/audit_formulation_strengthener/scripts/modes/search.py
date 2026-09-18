@@ -1,113 +1,107 @@
-"""Режим ``search`` — поиск релевантных фрагментов ВНД.
-
-Реализация этапа 5: чистый LLM map-reduce.
+"""Режим ``search`` — поиск релевантных фрагментов ВНД (map → фильтр → top-K).
 
 Алгоритм:
-1. ``prepare_vnd`` (этап 3) — извлечь все чанки ВНД через
-   ``DocumentStructureChunker`` из ``legal_summarizer``.
+
+1. ``prepare_vnd`` — извлечь все чанки через ``extract_text`` + ``split_text``.
 2. **Map-фаза:** для каждого чанка — 1 LLM-вызов с промптом
-   ``prompts/search_chunk_system.md``. LLM возвращает
+   ``prompts/search_chunk_system.md`` (``{{VIOLATION_TEXT}}, {{VND_FILE}},
+   {{CHUNK_TEXT}}``). LLM возвращает
    ``{relation_type, relevance_score, why_matches}``.
-3. **Filter:** отбрасываем чанки с ``relevance_score < MIN_RELEVANCE_SCORE``.
-4. **Re-rank:** сортируем по ``relevance_score`` (убывание), берём top-K
-   (``TOP_K_CANDIDATES``).
-5. Возвращаем JSON со списком ``vnd_findings`` + метаданными.
+3. **Filter:** ``relevance_score < MIN_RELEVANCE_SCORE`` отбрасываются.
+4. **Re-rank:** сортировка по score убывание, top-``TOP_K_CANDIDATES``.
+5. Сквозные ``evidence_id`` ``"F1..FN"`` по successful+filtered.
+6. Возвращаем JSON со списком ``vnd_findings`` + метаданными.
 
-Single-flight защита — все LLM-вызовы проходят через ``guarded_chat``
-из ``legal_summarizer.scripts.llm.single_flight`` (см. ``scripts.llm``),
-что исключает параллельные вызовы внутри одного процесса.
-
-Skill-specific параметры (не вынесены в ``project.json::skills.*`` —
-не поддерживаются ``SkillSettings(extra="forbid")``):
-* ``TOP_K_CANDIDATES`` — сколько top-кандидатов передавать в synthesize;
-* ``MIN_RELEVANCE_SCORE`` — порог отсечения слаборелевантных кандидатов.
+Без секций (D13 fix): цитата = ``(source_file, chunk_index, text_excerpt)``.
+Без ``cache_key`` (D11/D16 fix). П3: ``--analyze-result`` опционален — если
+нет, используется сырой текст ``violation``.
 """
 
 from __future__ import annotations
 
-import sys
+import json
 from pathlib import Path
 from typing import Any
 
-# Добавляем scripts/ skill'а в sys.path.
-_SKILL_ROOT = Path(__file__).resolve().parents[2]
-_SCRIPTS_DIR = _SKILL_ROOT / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-from llm_client import JsonParseError, call_llm_json  # type: ignore[import-not-found]  # noqa: E402
-from prompts import load_prompt, render_prompt  # type: ignore[import-not-found]  # noqa: E402
-from vnd_io import VndInputError, prepare_vnd  # type: ignore[import-not-found]  # noqa: E402
-
-import output as _output  # type: ignore[import-not-found]  # noqa: E402
+from workspace.skills.audit_formulation_strengthener.scripts.llm import (
+    JsonParseError,
+    chat_json,
+)
+from workspace.skills.audit_formulation_strengthener.scripts.output import make_error
+from workspace.skills.audit_formulation_strengthener.scripts.prompts import (
+    PromptUnresolvedVarError,
+    load_prompt,
+    render_prompt,
+)
+from workspace.skills.audit_formulation_strengthener.scripts.vnd_io import (
+    VndInputError,
+    prepare_vnd,
+)
 
 
 __all__ = ["run"]
 
 
-# Skill-specific параметры (см. docstring).
+# Skill-specific параметры (вне SkillSettings(extra="forbid")).
 TOP_K_CANDIDATES: int = 10
 MIN_RELEVANCE_SCORE: float = 0.3
 
+# Единый whitelist relation_type на скилл (D15 fix).
 _ALLOWED_RELATION_TYPES = frozenset({
     "прямое_противоречие",
     "прямое_подтверждение",
     "косвенное_отношение",
     "контекст",
-    "нерелевантно",
 })
+
+# Обрезка чанка в search-промпте (символов). При превышении — хвост с маркером.
+_CHUNK_PROMPT_MAX_CHARS = 8000
+_EXCERPT_MAX_CHARS = 2000
 
 
 def run(
     *,
     violation: str,
     vnd_paths: list[str],
-    analyze_result_path: str | None = None,
     analyze_result: dict[str, Any] | None = None,
+    analyze_result_path: str | None = None,
     estimate_only: bool = False,
-    confirm: bool = False,
     max_chunks: int | None = None,
 ) -> tuple[dict[str, Any], str | None]:
-    """Поиск релевантных фрагментов ВНД (map-reduce через LLM).
+    """Поиск релевантных фрагментов ВНД.
 
     Args:
-        violation: текст отклонения.
+        violation: текст отклонения (fallback, если нет analyze_result).
         vnd_paths: список путей к файлам ВНД.
-        analyze_result_path: путь к кэшированному JSON результата analyze
-            (для улучшения формулировки violation перед map-фазой).
-        analyze_result: готовый результат analyze (in-memory).
+        analyze_result: in-memory результат analyze (приоритет над path).
+        analyze_result_path: путь к кэшированному JSON результата analyze.
         estimate_only: только оценка без LLM-вызовов.
-        confirm: подтверждение для длинных ВНД (пока не используется —
-            estimate-only достаточно для UX).
-        max_chunks: override safety net на число чанков.
+        max_chunks: override ``execution.max_chunks_for_execution``.
 
     Returns:
         ``(json_result, report_text_or_None)``.
     """
-    # Валидация ввода.
     if not vnd_paths:
-        return _output.make_error(
-            "Не указаны файлы ВНД", error_type="no_vnd"
-        ), None
+        return make_error("Не указаны файлы ВНД", error_type="no_vnd"), None
 
-    # Если передан analyze_result_path — загрузить для нормализованной формулировки.
-    normalized_violation = _resolve_violation_text(
+    # П3: если ни analyze_result, ни analyze_result_path — fallback на сырой violation.
+    normalized_violation, analyze_load_error = _resolve_violation_text(
         violation=violation,
         analyze_result=analyze_result,
         analyze_result_path=analyze_result_path,
     )
+    if analyze_load_error is not None:
+        return analyze_load_error, None
     if not normalized_violation or not normalized_violation.strip():
         normalized_violation = violation
 
     # Подготовка ВНД.
     try:
-        bundle = prepare_vnd(
-            vnd_paths=vnd_paths,
-            violation=violation,
-            max_chunks_per_file=max_chunks,
-        )
+        bundle = prepare_vnd(vnd_paths=vnd_paths, max_chunks=max_chunks)
     except VndInputError as exc:
-        return _output.make_error(exc.message, error_type=exc.error_type), None
+        return make_error(exc.message, error_type=exc.error_type), None
+
+    chunks_total = len(bundle.chunks)
 
     # Estimate-only — без LLM.
     if estimate_only:
@@ -115,53 +109,53 @@ def run(
             {
                 "status": "success",
                 "data": {
-                    "vnd_files": len(vnd_paths),
-                    "vnd_chunks_total": len(bundle.chunks),
-                    "cache_key": bundle.cache_key,
+                    "estimate": True,
                     "size_estimate": bundle.size_estimate,
-                    "top_k_candidates": TOP_K_CANDIDATES,
-                    "min_relevance_score": MIN_RELEVANCE_SCORE,
-                    "map_batches_planned": len(bundle.chunks),
-                    "synthesis_llm_calls_planned": 1,
+                    "llm_calls_planned": chunks_total,  # только map-вызовы
                 },
             },
             None,
         )
 
-    # === Map-фаза: по одному LLM-вызову на чанк ===
+    # Загрузить промпт.
     try:
         template = load_prompt("search_chunk_system")
     except FileNotFoundError as exc:
-        return _output.make_error(
-            f"Не удалось загрузить промпт: {exc}",
-            error_type="prompt_missing",
-        ), None
+        return (
+            make_error(
+                f"Не удалось загрузить промпт: {exc}",
+                error_type="prompt_missing",
+            ),
+            None,
+        )
 
+    # Map-фаза: по одному LLM-вызову на чанк.
     findings: list[dict[str, Any]] = []
     chunks_processed = 0
     chunks_failed = 0
 
     for vnd_chunk in bundle.chunks:
         chunks_processed += 1
-        system = render_prompt(
-            template,
-            {
-                "VIOLATION_TEXT": normalized_violation,
-                "VND_FILE": vnd_chunk.source_file,
-                "VND_SECTION": vnd_chunk.section_title
-                or vnd_chunk.section_path
-                or "(без заголовка)",
-                "CHUNK_TEXT": _truncate(vnd_chunk.text, max_chars=8000),
-            },
-        )
+        chunk_text = _truncate(vnd_chunk.text, max_chars=_CHUNK_PROMPT_MAX_CHARS)
         try:
-            parsed = call_llm_json(
+            system = render_prompt(
+                template,
+                VIOLATION_TEXT=normalized_violation,
+                VND_FILE=vnd_chunk.source_file,
+                CHUNK_TEXT=chunk_text,
+            )
+        except PromptUnresolvedVarError:
+            chunks_failed += 1
+            continue
+
+        try:
+            parsed = chat_json(
                 system=system,
                 user=f"Отклонение: {normalized_violation}",
                 operation="search_map",
             )
             finding = _normalize_finding(parsed, vnd_chunk=vnd_chunk)
-        except (JsonParseError, Exception) as exc:  # noqa: BLE001
+        except (JsonParseError, Exception):  # noqa: BLE001
             # Один неудачный чанк не должен ронять весь прогон.
             chunks_failed += 1
             continue
@@ -170,28 +164,40 @@ def run(
             chunks_failed += 1
             continue
 
-        # Отбрасываем нерелевантные.
         if finding["relevance_score"] < MIN_RELEVANCE_SCORE:
             continue
 
         findings.append(finding)
 
-    # === Re-rank: сортировка по score, top-K ===
+    # Все упали → status error llm_error (D7 fix).
+    if chunks_processed > 0 and chunks_failed == chunks_processed:
+        return (
+            make_error(
+                f"Все {chunks_processed} чанков ВНД провалились на LLM-вызове",
+                error_type="llm_error",
+            ),
+            None,
+        )
+
+    # Filter + Re-rank.
     findings.sort(key=lambda f: f["relevance_score"], reverse=True)
     top_findings = findings[:TOP_K_CANDIDATES]
+
+    # Сквозные evidence_id "F1..FN" по successful+filtered.
+    for i, finding in enumerate(top_findings, 1):
+        finding["evidence_id"] = f"F{i}"
 
     return (
         {
             "status": "success",
             "data": {
                 "vnd_findings": top_findings,
-                "vnd_chunks_total": len(bundle.chunks),
+                "vnd_chunks_total": chunks_total,
                 "chunks_processed": chunks_processed,
                 "chunks_failed": chunks_failed,
                 "chunks_relevant_total": len(findings),
                 "top_k_candidates": TOP_K_CANDIDATES,
                 "min_relevance_score": MIN_RELEVANCE_SCORE,
-                "cache_key": bundle.cache_key,
                 "normalized_violation_used": normalized_violation,
             },
         },
@@ -204,52 +210,55 @@ def _resolve_violation_text(
     violation: str,
     analyze_result: dict[str, Any] | None,
     analyze_result_path: str | None,
-) -> str:
-    """Получить нормализованную формулировку из analyze_result (если есть).
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Получить нормализованную формулировку из analyze_result.
 
-    Приоритет:
-    1. ``analyze_result`` (in-memory, передан из `_run_all`).
-    2. ``analyze_result_path`` (загрузить из файла).
-    3. Исходный ``violation`` (fallback).
+    Returns:
+        ``(normalized_text_or_None, error_or_None)``.
+        Если ничего не задано → ``(None, None)`` — caller использует violation.
     """
     candidate: dict[str, Any] | None = analyze_result
     if candidate is None and analyze_result_path:
         try:
-            import json as _json
-
-            candidate = _json.loads(
-                Path(analyze_result_path).read_text(encoding="utf-8")
+            candidate = json.loads(Path(analyze_result_path).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, make_error(
+                f"Файл результата analyze не найден: {analyze_result_path}",
+                error_type="analyze_result_unreadable",
             )
-        except (OSError, ValueError):
-            candidate = None
+        except (OSError, ValueError) as exc:
+            return None, make_error(
+                f"Не удалось прочитать файл результата analyze "
+                f"'{analyze_result_path}': {exc!r}",
+                error_type="analyze_result_unreadable",
+            )
 
     if isinstance(candidate, dict):
         data = candidate.get("data") or {}
         normalized = data.get("normalized")
         if isinstance(normalized, str) and normalized.strip():
-            return normalized
-    return violation
+            return normalized, None
+
+    return None, None  # caller: fallback на violation
 
 
 def _normalize_finding(
-    parsed: dict[str, Any],
+    parsed: Any,
     *,
     vnd_chunk: Any,
 ) -> dict[str, Any] | None:
-    """Привести ответ LLM по одному чанку к финальному формату."""
+    """Привести ответ LLM по одному чанку к финальному формату Finding."""
     if not isinstance(parsed, dict):
         return None
 
     relation_type = str(parsed.get("relation_type") or "").strip()
     if relation_type not in _ALLOWED_RELATION_TYPES:
-        # Не валидный тип — попробуем угадать по score.
         relation_type = "контекст"
 
     try:
         score = float(parsed.get("relevance_score"))
     except (TypeError, ValueError):
         return None
-    # clamp 0..1
     score = max(0.0, min(1.0, score))
 
     why = parsed.get("why_matches") or ""
@@ -259,9 +268,7 @@ def _normalize_finding(
     return {
         "source_file": vnd_chunk.source_file,
         "chunk_index": vnd_chunk.index,
-        "section_title": vnd_chunk.section_title,
-        "section_path": vnd_chunk.section_path,
-        "text_excerpt": _truncate(vnd_chunk.text, max_chars=2000),
+        "text_excerpt": _truncate(vnd_chunk.text, max_chars=_EXCERPT_MAX_CHARS),
         "relation_type": relation_type,
         "relevance_score": round(score, 3),
         "why_matches": why.strip(),
@@ -269,7 +276,14 @@ def _normalize_finding(
 
 
 def _truncate(text: str, *, max_chars: int) -> str:
-    """Обрезать текст с маркером ``[TRUNCATED]``, если он длиннее ``max_chars``."""
+    """Обрезать текст с маркером, если он длиннее ``max_chars``.
+
+    Маркер единый: ``\\n\\n[ФРАГМЕНТ ОБРЕЗАН: показаны первые <N> символов]``
+    (для search-промпта) или ``\\n\\n[TRUNCATED]`` (для excerpt).
+    """
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n\n[TRUNCATED]"
+    return (
+        text[:max_chars]
+        + f"\n\n[ФРАГМЕНТ ОБРЕЗАН: показаны первые {max_chars} символов]"
+    )

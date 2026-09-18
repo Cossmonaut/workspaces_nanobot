@@ -1,13 +1,10 @@
-"""Форматирование результатов для вывода.
+"""Форматирование результатов и ошибок для CLI/stdout.
 
-Для аудитора-человека (основной режим ``--mode synthesize``) — текстовый
-отчёт в формате Markdown (см. ``scripts/report/markdown_renderer.py``)
-записывается в файл или печатается в stdout.
+Формат успеха: ``{"mode": <mode>, "status": "success", "data": {...}}``.
+Формат ошибки: ``{"mode": <mode>, "status": "error", "data": {"message": ..., "error_type": ...}}``.
 
-Для промежуточных режимов (``analyze``, ``search``) и для CI/тестов —
-единый плоский JSON ``{mode, status, data}``. Формат совместим с
-``audit_analyzer.scripts.output.prepare_output`` (одинаковая верхнеуровневая
-структура, но без специфики SQL/vector).
+Совместимо с ``audit_analyzer.scripts.output.prepare_output`` —
+одинаковая верхнеуровневая структура.
 """
 
 from __future__ import annotations
@@ -17,22 +14,27 @@ from typing import Any
 from lib.utils.text_utils import sanitize_value
 
 
-__all__ = ["prepare_output", "make_error"]
+__all__ = ["prepare_output", "make_error", "sanitize_output"]
 
 
 def prepare_output(result: dict[str, Any], mode: str) -> dict[str, Any]:
-    """Привести результат режима к плоскому формату для вывода в JSON.
+    """Привести результат режима к плоскому формату ``{mode, status, data}``.
 
     Args:
-        result: dict с результатом работы режима (зависит от mode).
-        mode: ``"analyze"`` | ``"search"`` | ``"synthesize"``.
+        result: dict с результатом работы режима.
+        mode: имя режима (``"analyze" | "search" | "synthesize" | "all"``).
 
     Returns:
-        dict верхнего уровня с ключами ``mode``, ``status`` и
-        ``data`` (плоский dict с результатом; datetime/Decimal/NaN/bytes
-        сериализуются через ``sanitize_value``).
+        dict верхнего уровня с ключами ``mode``, ``status`` и ``data``.
     """
-    sanitized = sanitize_value(result) if result else {}
+    if not result:
+        return {
+            "mode": mode,
+            "status": "error",
+            "data": {"message": "пустой результат"},
+        }
+
+    sanitized = sanitize_value(result)
     return {
         "mode": mode,
         "status": sanitized.get("status", "success"),
@@ -41,18 +43,22 @@ def prepare_output(result: dict[str, Any], mode: str) -> dict[str, Any]:
 
 
 def make_error(message: str, *, error_type: str | None = None) -> dict[str, Any]:
-    """Сформировать стандартный JSON-ответ с ошибкой.
+    """Сформировать JSON-ответ с ошибкой.
 
     Args:
-        message: человекочитаемое сообщение об ошибке.
-        error_type: машинно-читаемая категория (например,
-            ``"vnd_unreadable"``, ``"json_parse_failed"``,
-            ``"vnd_not_found"``).
+        message: человекочитаемое сообщение.
+        error_type: машинно-читаемая категория (например, ``vnd_not_found``,
+            ``json_parse_failed``, ``empty_violation``).
 
     Returns:
-        ``{"status": "error", "data": {"message": ..., "error_type": ...?}}``.
+        ``{"status": "error", "data": {"message": ..., "error_type": ...}}``.
     """
     data: dict[str, Any] = {"message": message}
     if error_type:
         data["error_type"] = error_type
     return {"status": "error", "data": data}
+
+
+def sanitize_output(out: dict[str, Any]) -> dict[str, Any]:
+    """Привести dict к JSON-safe виду (через ``lib.utils.text_utils.sanitize_value``)."""
+    return sanitize_value(out)
