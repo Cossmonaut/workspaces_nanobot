@@ -97,8 +97,9 @@ python workspace/skills/audit_formulation_strengthener/scripts/cli.py \
     --output report.md
 ```
 
-Для длинных ВНД skill вернёт `confirmation_required` с меню — покажи
-его пользователю и дождись явного выбора перед `--confirm`.
+Перед запуском на больших ВНД рекомендуется оценить объём работы
+(`--mode all --estimate-only`) — skill без LLM-вызовов вернёт `size_estimate`
+и число планируемых вызовов (`1+N+1`).
 
 ## Scheduled Reminders
 

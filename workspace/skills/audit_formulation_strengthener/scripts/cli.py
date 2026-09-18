@@ -20,14 +20,14 @@ Exit-коды:
   ``empty_violation``, ``analyze_result_unreadable``,
   ``search_result_unreadable``, ``unknown_mode``).
 
-П6: ``--estimate-only + --output`` → ``--output`` игнорируется, оценка
-только в stdout.
+Поведенческие решения:
 
-D9 fix: пустой ``--vnd`` → JSON ``no_vnd`` в stdout + exit 2 (не
-``argparse.SystemExit(2)`` с usage в stderr).
-
-D10 fix: при записи в файл через ``--output`` всё равно печатается краткий
-JSON ``{mode, status, saved_to}`` в stdout.
+* ``--estimate-only + --output`` → ``--output`` игнорируется (нет
+  артефакта — нет файла).
+* Пустой ``--vnd`` → JSON ``no_vnd`` в stdout + exit 2 (а не
+  ``argparse.SystemExit(2)`` с usage в stderr).
+* При записи в файл через ``--output`` в stdout также печатается краткий
+  JSON ``{mode, status, saved_to}`` для наблюдаемости.
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ def _emit(
         payload: что писать (str для report, dict для JSON).
         kind: ``"report"`` (plain text) или ``"json"``.
         target_path: путь к файлу; ``None`` → stdout.
-        mode: имя режима (для D10 brief).
+        mode: имя режима (для краткого вывода после записи файла).
     """
     is_report = kind == "report"
     if target_path:
@@ -206,7 +206,7 @@ def _emit(
 
 
 def _emit_brief(mode: str, saved_to: str) -> None:
-    """Краткий ``{mode, status, saved_to}`` в stdout (D10 fix)."""
+    """Краткий ``{mode, status, saved_to}`` в stdout после записи файла через ``--output``."""
     brief = {"mode": mode, "status": "success", "saved_to": saved_to}
     print(json.dumps(brief, ensure_ascii=False))
 
@@ -296,7 +296,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _ensure_registered()
 
-    # D9 fix: пустой --vnd → JSON no_vnd в stdout + exit 2.
+    # Пустой --vnd → JSON no_vnd в stdout + exit 2
+    # (а не argparse.SystemExit(2) с usage в stderr).
     if not args.vnd_paths and not args.estimate_only:
         # Для estimate-only без --vnd нужно дать каждому режиму шанс
         # вернуть свою оценку (analyze = без vnd, search/synthesize = no_vnd).
@@ -332,7 +333,8 @@ def main(argv: list[str] | None = None) -> int:
         _emit(err, kind="json", target_path=None, mode=args.mode)
         return 1
 
-    # П6: --estimate-only + --output → --output игнорируется.
+    # --estimate-only + --output → --output игнорируется
+    # (нет артефакта — нет файла).
     output_target = None if args.estimate_only else args.output
 
     status = result.get("status", "error")
@@ -361,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
     )
 
-    # D10 fix: при записи в файл — краткий JSON в stdout.
+    # При записи в файл — краткий JSON в stdout для наблюдаемости.
     if status == "success" and output_target is not None:
         _emit_brief(args.mode, str(Path(output_target).resolve()))
 

@@ -20,7 +20,7 @@
 строкой «Отклонено проверкой: N цитат не прошли сверку с источником».
 Если все отброшены — статус всё равно ``success`` (с предупреждением).
 
-П4: ``estimate-only`` делает parse+chunk ВНД ради ``N`` (0 LLM-вызовов,
+``estimate-only`` делает parse+chunk ВНД ради ``N`` (0 LLM-вызовов,
 но I/O происходит). Это ожидаемое поведение — фиксируется в ``contracts.md``.
 """
 
@@ -121,7 +121,8 @@ def run(
     if search_err is not None:
         return search_err, None
 
-    # Estimate-only: parse+chunk ВНД ради N (П4). Нужны vnd_paths.
+    # estimate-only: parse+chunk ВНД ради N. Без vnd_paths — no_vnd
+    # (нельзя посчитать 1+N+1 без N).
     if estimate_only:
         if not vnd_paths:
             return (

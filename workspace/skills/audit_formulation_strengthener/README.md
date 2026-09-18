@@ -8,7 +8,7 @@
 2. Принимает **один или несколько файлов ВНД** (`.pdf` / `.docx` / `.txt`).
 3. Возвращает **человекочитаемый отчёт** (`.md` / `.docx` / `.txt`) в строгом русском юридическом стиле:
    - нормализация формулировки отклонения;
-   - релевантные пункты / абзацы / смысловые куски из ВНД с дословными цитатами;
+   - релевантные пункты / абзацы / смысловые куски из ВНД с **валидированными цитатами**;
    - объяснение «почему этот фрагмент ВНД соотносится с отклонением»;
    - вердикт о достаточности формулировки (достаточно / требует усиления);
    - рекомендуемая усиленная формулировка, готовая для вставки в акт.
@@ -20,6 +20,15 @@ python workspace/skills/audit_formulation_strengthener/scripts/cli.py \
     --violation "Срок хранения персональных данных установлен 1 год" \
     --vnd vnd1.pdf --vnd vnd2.docx \
     --output report.md
+```
+
+Перед запуском можно оценить объём работы без LLM:
+
+```bash
+python workspace/skills/audit_formulation_strengthener/scripts/cli.py \
+    --mode all --estimate-only \
+    --violation "Срок хранения ПДн установлен 1 год" \
+    --vnd vnd1.pdf
 ```
 
 ## Когда использовать
@@ -35,9 +44,20 @@ python workspace/skills/audit_formulation_strengthener/scripts/cli.py \
 - Саммари одного документа без привязки к отклонению — это `legal_summarizer`.
 - Анализ данных аудита из БД — это `audit_analyzer`.
 
+## Структура отчёта
+
+Отчёт содержит 6 разделов:
+
+1. Краткое изложение отклонения.
+2. Установленные факты (по ВНД).
+3. Анализ отклонения.
+4. Релевантные фрагменты ВНД (валидированные цитаты).
+5. Итоговая классификация.
+6. Рекомендуемая усиленная формулировка.
+
 ## Документация
 
 - [`SKILL.md`](SKILL.md) — контракт skill'а для агента.
-- [`references/architecture.md`](references/architecture.md) — архитектура.
-- [`references/contracts.md`](references/contracts.md) — JSON-контракты режимов.
+- [`references/architecture.md`](references/architecture.md) — архитектура, инварианты, boundary.
+- [`references/contracts.md`](references/contracts.md) — JSON-контракты всех режимов, error_type → exit-code, контракт evidence_id и валидации цитат.
 - [`references/testing.md`](references/testing.md) — тестовая инфраструктура.

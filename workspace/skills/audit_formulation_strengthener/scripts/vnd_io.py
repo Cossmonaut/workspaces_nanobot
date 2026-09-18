@@ -7,11 +7,12 @@
   ``workspace.utils.office_files.extract_text``, чанкует через
   ``lib.services.text_splitter.split_text``.
 
-Без секций (D13 fix): ``text_splitter.split_text`` не знает про разделы.
-Цитата = ``(source_file, chunk_index, text_excerpt)``.
+Без секций: ``text_splitter.split_text`` не различает разделы документа.
+Цитата в результатах поиска идентифицируется тройкой
+``(source_file, chunk_index, text_excerpt)``.
 
-Без ``cache_key``: SHA-256-ключ прежней реализации был мёртвым полем,
-удалён вместе с vnd_chunking/ (D11/D16 fix).
+SHA-256 ключ по ``violation + paths`` (прежний ``cache_key``) удалён —
+был мёртвым полем, реальных кэш-провайдеров не использовал.
 """
 
 from __future__ import annotations
@@ -121,9 +122,12 @@ def prepare_vnd(
         )
 
     # 2. Извлечение текста и чанкование.
+    # chunk_size / chunk_overlap — строго из project.json через
+    # lib.core.skill_config.get_chunking_config. Дефолты там же (если
+    # ключ не задан в project.json — fallback в lib, не здесь).
     chunking = get_chunking_config()
-    chunk_size = int(chunking.get("chunk_size", 6000))
-    chunk_overlap = int(chunking.get("chunk_overlap", 400))
+    chunk_size = int(chunking["chunk_size"])
+    chunk_overlap = int(chunking["chunk_overlap"])
 
     chunks: list[VndChunk] = []
     chunks_per_file: list[int] = []
@@ -149,7 +153,8 @@ def prepare_vnd(
                 file=str(path),
             ) from exc
 
-        # 2b. Пустой текст → vnd_empty С ИМЕНЕМ ФАЙЛА (D4 fix).
+        # 2b. Пустой текст → vnd_empty с именем файла (явная ошибка,
+        #     не тихий пропуск — критично для аудитора).
         if not text or not text.strip():
             raise VndInputError(
                 f"Файл ВНД '{path}' не содержит текста "
@@ -173,7 +178,8 @@ def prepare_vnd(
         chunks_per_file.append(per_file_count)
         chars_total += len(text)
 
-    # 3. Лимит на суммарное число чанков (D5 fix).
+    # 3. Лимит на суммарное число чанков (safety net из project.json:
+    #     execution.max_chunks_for_execution).
     if max_chunks is None:
         tool_cfg = get_tool_config(_SKILL_NAME)
         configured = tool_cfg.get("execution", {}).get("max_chunks_for_execution")

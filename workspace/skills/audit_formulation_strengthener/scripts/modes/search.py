@@ -12,9 +12,11 @@
 5. Сквозные ``evidence_id`` ``"F1..FN"`` по successful+filtered.
 6. Возвращаем JSON со списком ``vnd_findings`` + метаданными.
 
-Без секций (D13 fix): цитата = ``(source_file, chunk_index, text_excerpt)``.
-Без ``cache_key`` (D11/D16 fix). П3: ``--analyze-result`` опционален — если
-нет, используется сырой текст ``violation``.
+Без секций: цитата = ``(source_file, chunk_index, text_excerpt)``.
+SHA-256 ключ по violation+paths не используется.
+
+``--analyze-result`` опционален — если не задан, в LLM-промпт передаётся
+сырой текст ``violation`` (без нормализации).
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ __all__ = ["run"]
 TOP_K_CANDIDATES: int = 10
 MIN_RELEVANCE_SCORE: float = 0.3
 
-# Единый whitelist relation_type на скилл (D15 fix).
+# Единый whitelist relation_type для всего скилла (синхронизирован с synthesize).
 _ALLOWED_RELATION_TYPES = frozenset({
     "прямое_противоречие",
     "прямое_подтверждение",
@@ -84,7 +86,8 @@ def run(
     if not vnd_paths:
         return make_error("Не указаны файлы ВНД", error_type="no_vnd"), None
 
-    # П3: если ни analyze_result, ни analyze_result_path — fallback на сырой violation.
+    # Если ни analyze_result, ни analyze_result_path не заданы —
+    # fallback на сырой текст violation (без нормализации).
     normalized_violation, analyze_load_error = _resolve_violation_text(
         violation=violation,
         analyze_result=analyze_result,
@@ -169,7 +172,8 @@ def run(
 
         findings.append(finding)
 
-    # Все упали → status error llm_error (D7 fix).
+    # Если все чанки провалились на LLM — это ошибка llm_error,
+    # а не частичный success с пустым списком находок.
     if chunks_processed > 0 and chunks_failed == chunks_processed:
         return (
             make_error(
